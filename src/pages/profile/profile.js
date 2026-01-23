@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { ROUTES } from '../../routes';
 import axios from "axios";
 import { useNavigate, NavLink } from "react-router-dom";
 import "./profile.css";
@@ -48,7 +49,7 @@ const TopicButton = ({ children }) => {
     <button
       className="SubmitButton"
       onClick={() => {
-        navigate("/topic");
+        navigate(ROUTES.TOPIC + '/');
       }}
     >
       {children}
@@ -145,7 +146,7 @@ const ProfilePage = (props) => {
               return (
                 <NavLink
                   className="link"
-                  to={"/roadmap?topic=" + encodeURI(course)}
+                  to={ROUTES.ROADMAP + '?topic=' + encodeURI(course)}
                 >
                   <div
                     className="card"

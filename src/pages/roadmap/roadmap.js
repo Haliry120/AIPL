@@ -17,6 +17,7 @@ import { translateLocalStorage, translateObj } from "../../translate/translate";
 import Markdown from "react-markdown";
 import ConfettiExplosion from "react-confetti-explosion";
 import userManager from '../../utils/userManager';
+import { ROUTES } from '../../routes';
 
 const RoadmapPage = (props) => {
   const [resources, setResources] = useState(null);
@@ -27,16 +28,19 @@ const RoadmapPage = (props) => {
   const [roadmap, setRoadmap] = useState({});
   const [regenerating, setRegenerating] = useState(false);
   const [regenerateResource, setRegenerateResource] = useState(false);
+  const [canceling, setCanceling] = useState(false);
   const [topicDetails, setTopicDetails] = useState({
     time: "-",
     knowledge_level: "-",
   });
   const [quizStats, setQuizStats] = useState({});
   const [confettiExplode, setConfettiExplode] = useState(false);
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [confirmOptions, setConfirmOptions] = useState({});
   const navigate = useNavigate();
   const topic = searchParams.get("topic");
   if (!topic) {
-    navigate("/");
+    navigate(ROUTES.HOME);
   }
   useEffect(() => {
     const topics = JSON.parse(localStorage.getItem("topics")) || {};
@@ -80,6 +84,7 @@ const RoadmapPage = (props) => {
     const navigate = useNavigate();
     const [searchParams] = useSearchParams();
     const topic = searchParams.get("topic");
+
     return (
       <div
         className="flexbox subtopic"
@@ -99,7 +104,7 @@ const RoadmapPage = (props) => {
             {(
               parseFloat(subtopic.time.replace(/^\D+/g, "")) *
               (parseFloat(localStorage.getItem("hardnessIndex")) || 1)
-            ).toFixed(1)}{" "}
+            ).toFixed(1)}{' '}
             {subtopic.time.replace(/[0-9]/g, "")}
           </p>
           <p style={{ fontWeight: "300", opacity: "61%", marginTop: "1em" }}>
@@ -109,12 +114,9 @@ const RoadmapPage = (props) => {
         <div
           className="hardness"
           onClick={() => {
-            let hardness = prompt(
-              "请评价难度(1-10分)"
-            );
+            let hardness = prompt("请评价难度(1-10分)");
             if (hardness) {
-              let hardnessIndex =
-                parseFloat(localStorage.getItem("hardnessIndex")) || 1;
+              let hardnessIndex = parseFloat(localStorage.getItem("hardnessIndex")) || 1;
               hardnessIndex = hardnessIndex + (hardness - 5) / 10;
               localStorage.setItem("hardnessIndex", hardnessIndex);
               window.location.reload();
@@ -140,25 +142,36 @@ const RoadmapPage = (props) => {
           >
             学习资源
           </button>
-          {quizStats.timeTaken ? (
-            <div className="quiz_completed">
-              {((quizStats.numCorrect * 100) / quizStats.numQues).toFixed(1) +
-                "% Correct in " +
-                (quizStats.timeTaken / 1000).toFixed(0) +
-                "s"}
-            </div>
-          ) : (
-            <button
-              className="quizButton"
-              onClick={() => {
-                navigate(
-                  `/quiz?topic=${topic}&week=${weekNum}&subtopic=${number}`
-                );
-              }}
-            >
-              开始测验
-            </button>
-          )}
+          {(() => {
+            const taken = quizStats && (quizStats.completedAt || quizStats.timeTaken);
+            const score = quizStats && (quizStats.scorePercent !== undefined && quizStats.scorePercent !== null) ? quizStats.scorePercent : (taken ? null : null);
+            if (taken) {
+              return (
+                <>
+                  <div className="quiz-score">{score !== null ? (score + "%") : "—"}</div>
+                  <button
+                    className="quizButton"
+                    onClick={() => {
+                      navigate(`/quiz?topic=${topic}&week=${weekNum}&subtopic=${number}&view=true`);
+                    }}
+                  >
+                    查看测验
+                  </button>
+                </>
+              );
+            }
+
+            return (
+              <button
+                className="quizButton"
+                onClick={() => {
+                  navigate(`/quiz?topic=${topic}&week=${weekNum}&subtopic=${number}`);
+                }}
+              >
+                开始测验
+              </button>
+            );
+          })()}
         </div>
       </div>
     );
@@ -179,39 +192,21 @@ const RoadmapPage = (props) => {
       <div style={style}>
         <div className="topic-bar" style={{ "--clr": color }}>
           <div className="topic-bar-title">
-            <h3
-              className="week"
-              style={{ fontWeight: "400", textTransform: "capitalize" }}
-            >
+            <h3 className="week" style={{ fontWeight: "400", textTransform: "capitalize" }}>
               {week}
             </h3>
-            <h2
-              style={{
-                fontWeight: "400",
-                textTransform: "capitalize",
-                color: "white",
-              }}
-            >
+            <h2 style={{ fontWeight: "400", textTransform: "capitalize", color: "white" }}>
               {topic}
             </h2>
           </div>
           <button
             className="plus"
             style={{ transform: open ? "rotate(90deg)" : "rotate(0deg)" }}
-            onClick={() => {
-              setOpen(!open);
-            }}
+            onClick={() => setOpen(!open)}
           >
-            <ChevronRight
-              size={50}
-              strokeWidth={2}
-              color={color}
-            ></ChevronRight>
+            <ChevronRight size={50} strokeWidth={2} color={color}></ChevronRight>
           </button>
-          <div
-            className="subtopics"
-            style={{ display: open ? "block" : "none" }}
-          >
+          <div className="subtopics" style={{ display: open ? "block" : "none" }}>
             {subtopics?.map((subtopic, i) => (
               <Subtopic
                 subtopic={subtopic}
@@ -227,6 +222,7 @@ const RoadmapPage = (props) => {
       </div>
     );
   };
+    
 
   const ResourcesSection = ({ children }) => {
     return (
@@ -268,7 +264,7 @@ const RoadmapPage = (props) => {
                 .catch((err) => {
                   setLoading(false);
                   alert("生成资源时出错");
-                  navigate("/roadmap?topic=" + encodeURI(topic));
+                    navigate(ROUTES.ROADMAP + '?topic=' + encodeURI(topic));
                 });
             }}
           >
@@ -388,40 +384,207 @@ const RoadmapPage = (props) => {
   };
 
   const handleRegenerateRoadmap = async () => {  
-    setRegenerating(true);  
-    try {  
-        axios.defaults.baseURL = "http://localhost:5000";  
-        const response = await axios({  
-            method: "POST",  
-            url: "/api/roadmap",  
-            data: {  
-                topic: topic,  
-                time: topicDetails.time,  
-                knowledge_level: topicDetails.knowledge_level,  
-                regenerate: true  
-            },  
-            withCredentials: false,  
-            headers: {  
-                "Access-Control-Allow-Origin": "*",  
-                "X-User-ID": userManager.getUserId(),  
-            },  
-        });  
-          
-        setRoadmap(response.data);  
-        // 更新 localStorage  
-        const roadmaps = JSON.parse(localStorage.getItem('roadmaps')) || {};  
-        roadmaps[topic] = response.data;  
-        localStorage.setItem('roadmaps', JSON.stringify(roadmaps));  
-    } catch (error) {  
-        console.error('重新生成路线图失败:', error);  
-        alert('重新生成路线图失败，请稍后重试');  
-    } finally {  
-        setRegenerating(false);  
-    }
+    // 使用模态对话框替代 window.confirm：先询问是否保留设置
+    return new Promise((resolve) => {
+      setConfirmOptions({
+        title: '保留设置？',
+        message: '是否保留原来的学习时间和基础？(确定=保留，取消=重新设置)',
+        primaryText: '保留',
+        secondaryText: '不保留',
+        onConfirm: async () => {
+          setConfirmOpen(false);
+          // 用户选择保留，则再询问是否确认重新生成
+          setConfirmOptions({
+            title: '确认重新生成',
+            message: '重新生成会先删除现有学习路径和相关资源，是否继续？',
+            primaryText: '确认',
+            secondaryText: '取消',
+            onConfirm: async () => {
+              setConfirmOpen(false);
+              // 执行保留设置的重新生成逻辑
+              setRegenerating(true);
+              try {
+                axios.defaults.baseURL = 'http://localhost:5000';
+                const delRes = await axios({
+                  method: 'POST',
+                  url: '/api/cancel-course',
+                  data: { course: topic },
+                  headers: {
+                    'Access-Control-Allow-Origin': '*',
+                    'X-User-ID': userManager.getUserId(),
+                  },
+                });
+
+                if (!(delRes.data && delRes.data.success)) {
+                  alert('删除原有路径失败，已停止重新生成');
+                  setRegenerating(false);
+                  resolve(false);
+                  return;
+                }
+
+                // 本地清理
+                try {
+                  const roadmaps = JSON.parse(localStorage.getItem('roadmaps')) || {};
+                  delete roadmaps[topic];
+                  localStorage.setItem('roadmaps', JSON.stringify(roadmaps));
+
+                  const topics = JSON.parse(localStorage.getItem('topics')) || {};
+                  delete topics[topic];
+                  localStorage.setItem('topics', JSON.stringify(topics));
+
+                  const stats = JSON.parse(localStorage.getItem('quizStats')) || {};
+                  delete stats[topic];
+                  localStorage.setItem('quizStats', JSON.stringify(stats));
+                } catch (e) {
+                  console.warn('清理 localStorage 时出错', e);
+                }
+
+                // 再生成新的路线图（保持原有 time/knowledge）
+                const response = await axios({
+                  method: 'POST',
+                  url: '/api/roadmap',
+                  data: {
+                    topic: topic,
+                    time: topicDetails.time,
+                    knowledge_level: topicDetails.knowledge_level,
+                    regenerate: true,
+                  },
+                  withCredentials: false,
+                  headers: {
+                    'Access-Control-Allow-Origin': '*',
+                    'X-User-ID': userManager.getUserId(),
+                  },
+                });
+
+                setRoadmap(response.data);
+
+                // 更新 localStorage
+                const roadmaps = JSON.parse(localStorage.getItem('roadmaps')) || {};
+                roadmaps[topic] = response.data;
+                localStorage.setItem('roadmaps', JSON.stringify(roadmaps));
+
+                // 恢复 topics 中的时间和知识水平
+                try {
+                  const topics = JSON.parse(localStorage.getItem('topics')) || {};
+                  topics[topic] = { ...topics[topic], time: topicDetails.time, knowledge_level: topicDetails.knowledge_level };
+                  localStorage.setItem('topics', JSON.stringify(topics));
+                  setTopicDetails({ time: topicDetails.time, knowledge_level: topicDetails.knowledge_level });
+                } catch (e) {
+                  console.warn('更新 topics 本地存储失败', e);
+                }
+                resolve(true);
+              } catch (error) {
+                console.error('重新生成路线图失败:', error);
+                alert('重新生成路线图失败，请稍后重试');
+                resolve(false);
+              } finally {
+                setRegenerating(false);
+              }
+            },
+            onCancel: () => {
+              setConfirmOpen(false);
+              resolve(false);
+            },
+          });
+          setConfirmOpen(true);
+        },
+        onCancel: () => {
+          setConfirmOpen(false);
+          // 用户选择不保留设置：直接跳转到选择页（在选择页点击开始学习会自动删除旧数据并生成）
+          navigate(ROUTES.TOPIC + '?topic=' + encodeURIComponent(topic) + '&regenerate=true');
+          resolve(true);
+        },
+      });
+      setConfirmOpen(true);
+    });
+  };
+
+  const handleCancelCourse = async () => {
+    // 使用模态确认
+    setConfirmOptions({
+      title: `确认取消《${topic}》？`,
+      message: '这将删除该课程的所有本地和服务器数据，操作不可撤销。',
+      primaryText: '确认取消',
+      secondaryText: '取消',
+      onConfirm: async () => {
+        setConfirmOpen(false);
+        setCanceling(true);
+        try {
+          axios.defaults.baseURL = "http://localhost:5000";
+          const res = await axios({
+            method: "POST",
+            url: "/api/cancel-course",
+            data: { course: topic },
+            headers: {
+              "Access-Control-Allow-Origin": "*",
+              "X-User-ID": userManager.getUserId(),
+            },
+          });
+
+          if (res.data && res.data.success) {
+            // 从 localStorage 中移除相关数据
+            try {
+              const roadmaps = JSON.parse(localStorage.getItem('roadmaps')) || {};
+              delete roadmaps[topic];
+              localStorage.setItem('roadmaps', JSON.stringify(roadmaps));
+
+              const topics = JSON.parse(localStorage.getItem('topics')) || {};
+              delete topics[topic];
+              localStorage.setItem('topics', JSON.stringify(topics));
+
+              const stats = JSON.parse(localStorage.getItem('quizStats')) || {};
+              delete stats[topic];
+              localStorage.setItem('quizStats', JSON.stringify(stats));
+            } catch (e) {
+              console.warn('清理 localStorage 时出错', e);
+            }
+
+            alert('已取消学习并删除相关数据');
+            navigate('/');
+          } else {
+            alert('取消学习失败，请稍后重试');
+          }
+        } catch (err) {
+          console.error(err);
+          alert('取消学习时出错，请稍后重试');
+        } finally {
+          setCanceling(false);
+        }
+      },
+      onCancel: () => {
+        setConfirmOpen(false);
+      },
+    });
+    setConfirmOpen(true);
   };
 
   return (
     <div className="roadmap_wrapper">
+      {/* 通用确认模态（用于取消学习 / 重新生成确认） - 顶层，背景为当前页面并虚化 */}
+      <Modal open={confirmOpen} onClose={() => setConfirmOpen(false)} simple={true}>
+        <div className="confirm-box">
+          <h2>{confirmOptions.title}</h2>
+          <p>{confirmOptions.message}</p>
+          <div className="confirm-actions">
+            <button
+              className="confirm-no"
+              onClick={() => {
+                confirmOptions.onCancel && confirmOptions.onCancel();
+              }}
+            >
+              {confirmOptions.secondaryText || '取消'}
+            </button>
+            <button
+              className="confirm-yes"
+              onClick={() => {
+                confirmOptions.onConfirm && confirmOptions.onConfirm();
+              }}
+            >
+              {confirmOptions.primaryText || '确认'}
+            </button>
+          </div>
+        </div>
+      </Modal>
       <Modal
         open={modalOpen}
         onClose={() => {
@@ -515,21 +678,37 @@ const RoadmapPage = (props) => {
           <h2 style={{ display: "inline-block", color: "#B6B6B6" }}>
             {topicDetails.time}
           </h2>
-          <button   
-              onClick={handleRegenerateRoadmap}  
-              disabled={regenerating}  
-              style={{   
-                  marginLeft: "1em",   
-                  padding: "0.5em 1em",  
-                  backgroundColor: "#4EAAD1",  
-                  color: "white",  
-                  border: "none",  
-                  borderRadius: "5px",  
-                  cursor: regenerating ? "not-allowed" : "pointer"  
-              }}  
-          >  
-              {regenerating ? '生成中...' : '重新生成'}  
-          </button> 
+          <div style={{ display: "inline-flex", alignItems: "center", gap: "0.5cm", marginLeft: "1em" }}>
+            <button
+              onClick={handleRegenerateRoadmap}
+              disabled={regenerating}
+              style={{
+                padding: "0.5em 1em",
+                backgroundColor: "#4EAAD1",
+                color: "white",
+                border: "none",
+                borderRadius: "5px",
+                cursor: regenerating ? "not-allowed" : "pointer",
+              }}
+            >
+              {regenerating ? "生成中..." : "重新生成"}
+            </button>
+
+            <button
+              onClick={handleCancelCourse}
+              disabled={canceling}
+              style={{
+                padding: "0.5em 1em",
+                backgroundColor: "#D14E4E",
+                color: "white",
+                border: "none",
+                borderRadius: "5px",
+                cursor: canceling ? "not-allowed" : "pointer",
+              }}
+            >
+              {canceling ? "取消中..." : "取消学习"}
+            </button>
+          </div>
         </div>
         <div className="roadmap">
           {Object.keys(roadmap)
