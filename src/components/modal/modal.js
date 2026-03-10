@@ -1,6 +1,5 @@
 import { X } from "lucide-react";
 import "./modal.css";
-import { useEffect, useState } from "react";
 const Modal = ({ children, open = false, onClose, simple = false }) => {
   if (simple) {
     return (

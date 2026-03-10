@@ -6,18 +6,18 @@ import Header from "../../components/header/header";
 import Loader from "../../components/loader/loader";
 import Modal from "../../components/modal/modal";
 import {
-  CirclePlus,
-  ChevronDown,
   ChevronRight,
-  LoaderPinwheel,
   FolderSearch,
   Bot,
 } from "lucide-react";
-import { translateLocalStorage, translateObj } from "../../translate/translate";
 import Markdown from "react-markdown";
 import ConfettiExplosion from "react-confetti-explosion";
 import userManager from '../../utils/userManager';
 import { ROUTES } from '../../routes';
+
+const API_BASE = process.env.REACT_APP_API_URL || "http://localhost:5000";
+axios.defaults.baseURL = API_BASE;
+userManager.applyAuthHeader(axios);
 
 const RoadmapPage = (props) => {
   const [resources, setResources] = useState(null);
@@ -66,9 +66,7 @@ const RoadmapPage = (props) => {
       //   alert(`Roadmap for ${topic} not found. Please generate it first.`);
       navigate("/");
     }
-    console.log(roadmap);
-    console.log(topicDetails);
-  }, [topic]);
+  }, [topic, navigate]);
 
   const colors = [
     "#D14EC4",
@@ -114,7 +112,7 @@ const RoadmapPage = (props) => {
         <div
           className="hardness"
           onClick={() => {
-            let hardness = prompt("请评价难度(1-10分)");
+            let hardness = prompt("请评价难度 (1-10)");
             if (hardness) {
               let hardnessIndex = parseFloat(localStorage.getItem("hardnessIndex")) || 1;
               hardnessIndex = hardnessIndex + (hardness - 5) / 10;
@@ -148,7 +146,7 @@ const RoadmapPage = (props) => {
             if (taken) {
               return (
                 <>
-                  <div className="quiz-score">{score !== null ? (score + "%") : "—"}</div>
+                  <div className="quiz-score">{score !== null ? (score + "%") : "--"}</div>
                   <button
                     className="quizButton"
                     onClick={() => {
@@ -232,7 +230,7 @@ const RoadmapPage = (props) => {
             className="primary"
             onClick={() => {
               setLoading(true);
-              axios.defaults.baseURL = "http://localhost:5000";
+              axios.defaults.baseURL = API_BASE;
 
               axios({
                 method: "POST",
@@ -241,11 +239,7 @@ const RoadmapPage = (props) => {
                     ...resourceParam,
                     regenerate: regenerateResource  // 添加重新生成标志
                 },
-                withCredentials: false,
-                headers: {
-                  "Access-Control-Allow-Origin": "*",
-                  "X-User-ID": userManager.getUserId(), // 添加用户ID
-                },
+                withCredentials: true,
               })
                 .then((res) => {
                   setLoading(false);
@@ -278,7 +272,7 @@ const RoadmapPage = (props) => {
                       checked={regenerateResource}  
                       onChange={(e) => setRegenerateResource(e.target.checked)}  
                   />  
-                  重新生成（不使用缓存）  
+                  重新生成（不使用缓存）
               </label>  
           </div> */}
         </div>
@@ -289,7 +283,7 @@ const RoadmapPage = (props) => {
             id="searchWidgetTrigger"
             onClick={() => {
               setLoading(true);
-              axios.defaults.baseURL = "http://localhost:5000";
+              axios.defaults.baseURL = API_BASE;
 
               axios({
                 method: "POST",
@@ -298,11 +292,7 @@ const RoadmapPage = (props) => {
                   subtopic: resourceParam.subtopic,
                   course: resourceParam.course
                 },
-                withCredentials: false,
-                headers: {
-                  "Access-Control-Allow-Origin": "*",
-                  "X-User-ID": userManager.getUserId(), // 添加用户ID
-                },
+                withCredentials: true,
               })
                 .then((res) => {
                   setLoading(false);
@@ -317,8 +307,8 @@ const RoadmapPage = (props) => {
                         </p>
                         <p style={{ color: "#999", marginTop: "1em" }}>
                           建议尝试:
-                          <br/>• 使用左侧的"AI Generated Resources"获取学习资源
-                          <br/>• 手动在 Bilibili 搜索相关内容
+                          <br/>使用左侧AI Generated Resources"获取学习资源
+                          <br/>或手动在Bilibili搜索相关内容
                         </p>
                       </div>
                     );
@@ -327,7 +317,7 @@ const RoadmapPage = (props) => {
                       <div className="res">
                         <h2 className="res-heading">在线课程 - {resourceParam.subtopic}</h2>
                         <p style={{ fontSize: "0.9em", color: "#666", marginBottom: "1em" }}>
-                          找到 {res.data.courses.length} 个相关课程 (搜索: {res.data.keyword})
+                          找到 {res.data.courses.length} 个相关课程(搜索: {res.data.keyword})
                         </p>
                         <div className="course-list">
                           {res.data.courses.map((course, index) => (
@@ -348,7 +338,7 @@ const RoadmapPage = (props) => {
                                 </a>
                               </h3>
                               <p style={{ fontSize: "0.9em", color: "#666", marginBottom: "0.5em" }}>
-                                UP主: {course.author} | 播放量: {course.play}
+                                UP主 {course.author} | 播放量 {course.play}
                               </p>
                               <p style={{ fontSize: "0.85em", color: "#999" }}>
                                 {course.description}
@@ -404,15 +394,12 @@ const RoadmapPage = (props) => {
               // 执行保留设置的重新生成逻辑
               setRegenerating(true);
               try {
-                axios.defaults.baseURL = 'http://localhost:5000';
+                axios.defaults.baseURL = API_BASE;
                 const delRes = await axios({
                   method: 'POST',
                   url: '/api/cancel-course',
                   data: { course: topic },
-                  headers: {
-                    'Access-Control-Allow-Origin': '*',
-                    'X-User-ID': userManager.getUserId(),
-                  },
+                  withCredentials: true,
                 });
 
                 if (!(delRes.data && delRes.data.success)) {
@@ -439,7 +426,7 @@ const RoadmapPage = (props) => {
                   console.warn('清理 localStorage 时出错', e);
                 }
 
-                // 再生成新的路线图（保持原有 time/knowledge）
+                // 再生成新的路线图（保持原 time/knowledge）
                 const response = await axios({
                   method: 'POST',
                   url: '/api/roadmap',
@@ -449,11 +436,7 @@ const RoadmapPage = (props) => {
                     knowledge_level: topicDetails.knowledge_level,
                     regenerate: true,
                   },
-                  withCredentials: false,
-                  headers: {
-                    'Access-Control-Allow-Origin': '*',
-                    'X-User-ID': userManager.getUserId(),
-                  },
+                  withCredentials: true,
                 });
 
                 setRoadmap(response.data);
@@ -474,7 +457,7 @@ const RoadmapPage = (props) => {
                 }
                 resolve(true);
               } catch (error) {
-                console.error('重新生成路线图失败:', error);
+                console.error('重新生成路线图失败', error);
                 alert('重新生成路线图失败，请稍后重试');
                 resolve(false);
               } finally {
@@ -510,15 +493,12 @@ const RoadmapPage = (props) => {
         setConfirmOpen(false);
         setCanceling(true);
         try {
-          axios.defaults.baseURL = "http://localhost:5000";
+          axios.defaults.baseURL = API_BASE;
           const res = await axios({
             method: "POST",
             url: "/api/cancel-course",
             data: { course: topic },
-            headers: {
-              "Access-Control-Allow-Origin": "*",
-              "X-User-ID": userManager.getUserId(),
-            },
+            withCredentials: true,
           });
 
           if (res.data && res.data.success) {
@@ -560,7 +540,7 @@ const RoadmapPage = (props) => {
 
   return (
     <div className="roadmap_wrapper">
-      {/* 通用确认模态（用于取消学习 / 重新生成确认） - 顶层，背景为当前页面并虚化 */}
+      {/* 通用确认模态（用于取消学习 / 重新生成确认）- 顶层，背景为当前页面并虚化 */}
       <Modal open={confirmOpen} onClose={() => setConfirmOpen(false)} simple={true}>
         <div className="confirm-box">
           <h2>{confirmOptions.title}</h2>
@@ -615,7 +595,7 @@ const RoadmapPage = (props) => {
                     setRegenerateResource(true);  
                     // 重新调用生成函数  
                     setLoading(true);  
-                    axios.defaults.baseURL = "http://localhost:5000"; 
+                    axios.defaults.baseURL = API_BASE; 
                     
                     axios({  
                         method: "POST",  
@@ -624,11 +604,7 @@ const RoadmapPage = (props) => {
                           ...resourceParam,  
                           regenerate: true  
                         },  
-                        withCredentials: false,  
-                        headers: {  
-                          "Access-Control-Allow-Origin": "*",  
-                          "X-User-ID": localStorage.getItem('user_id'),  
-                        },  
+                        withCredentials: true,  
                       })  
                         .then((res) => {  
                           setLoading(false);  

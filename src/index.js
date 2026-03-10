@@ -1,16 +1,67 @@
 import React from "react";
-import { RouterProvider, createBrowserRouter } from "react-router-dom";
+import { RouterProvider, createBrowserRouter, Navigate } from "react-router-dom";
 import ReactDOM from "react-dom/client";
 import "./index.css";
-import { TopicPage, RoadmapPage, QuizPage, ProfilePage } from "./pages/index";
+import { TopicPage, RoadmapPage, QuizPage, ProfilePage, UserprofilePage, WrongPage, RedoPage, RedoPlayPage, LoginPage, RegisterPage, SettingsPage } from "./pages/index";
 import { ROUTES } from './routes';
 import App from "./App";
 import reportWebVitals from "./reportWebVitals";
+import userManager from "./utils/userManager";
+
+const RequireAuth = ({ children }) => {
+  if (!userManager.isAuthenticated()) {
+    return <Navigate to={ROUTES.LOGIN} replace />;
+  }
+  return children;
+};
+
+const GuestOnly = ({ children }) => {
+  if (userManager.isAuthenticated()) {
+    return <Navigate to={ROUTES.HOME} replace />;
+  }
+  return children;
+};
 
 const router = createBrowserRouter([
   {
     path: ROUTES.HOME,
-    element: <ProfilePage />,
+    element: (
+      <RequireAuth>
+        <ProfilePage />
+      </RequireAuth>
+    ),
+  },
+  {
+    path: ROUTES.LOGIN,
+    element: (
+      <GuestOnly>
+        <LoginPage />
+      </GuestOnly>
+    ),
+  },
+  {
+    path: ROUTES.REGISTER,
+    element: (
+      <GuestOnly>
+        <RegisterPage />
+      </GuestOnly>
+    ),
+  },
+  {
+    path: ROUTES.PROFILE,
+    element: (
+      <RequireAuth>
+        <UserprofilePage />
+      </RequireAuth>
+    ),
+  },
+  {
+    path: ROUTES.SETTINGS,
+    element: (
+      <RequireAuth>
+        <SettingsPage />
+      </RequireAuth>
+    ),
   },
   {
     path: "/test",
@@ -18,15 +69,51 @@ const router = createBrowserRouter([
   },
   {
     path: ROUTES.ROADMAP + '/',
-    element: <RoadmapPage />,
+    element: (
+      <RequireAuth>
+        <RoadmapPage />
+      </RequireAuth>
+    ),
   },
   {
     path: ROUTES.QUIZ + '/',
-    element: <QuizPage />,
+    element: (
+      <RequireAuth>
+        <QuizPage />
+      </RequireAuth>
+    ),
   },
   {
     path: ROUTES.TOPIC + '/',
-    element: <TopicPage />,
+    element: (
+      <RequireAuth>
+        <TopicPage />
+      </RequireAuth>
+    ),
+  },
+  {
+    path: ROUTES.WRONG + '/',
+    element: (
+      <RequireAuth>
+        <WrongPage />
+      </RequireAuth>
+    ),
+  },
+  {
+    path: ROUTES.REDO + '/',
+    element: (
+      <RequireAuth>
+        <RedoPage />
+      </RequireAuth>
+    ),
+  },
+  {
+    path: ROUTES.REDO_PLAY + '/',
+    element: (
+      <RequireAuth>
+        <RedoPlayPage />
+      </RequireAuth>
+    ),
   },
 ]);
 

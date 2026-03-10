@@ -17,6 +17,7 @@ cd ..
 create `.env` file in `./backend/` directory with the following contents (get your api key from [here](https://ai.google.dev/aistudio) )
 ```bash
 GEMINI_API_KEY=YOUR_GEMINI_API_KEY
+JWT_SECRET_KEY=YOUR_JWT_SECRET_KEY
 ```
 then to start backend
 ```bash
@@ -26,6 +27,21 @@ and to start frontend
 ```bash
 npm start
 ```
+
+## Authentication Flow
+
+- You must register or login before entering the home page.
+- After login, the frontend stores JWT token in `localStorage` and sends it as `Authorization: Bearer <token>`.
+- All `/api/*` endpoints are protected except:
+	- `/api/health`
+	- `/api/auth/register`
+	- `/api/auth/login`
+	- `/api/auth/logout`
+
+Password policy:
+
+- Minimum 8 characters
+- Must contain letters and numbers
 ![alt text](public/image.png)
 ![alt text](public/image-1.png)
 ![alt text](public/image-2.png)

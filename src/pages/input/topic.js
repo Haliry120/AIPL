@@ -10,6 +10,10 @@ import { ArrowRight, LibraryBig, Search } from "lucide-react";
 import Loader from "../../components/loader/loader";
 import userManager from '../../utils/userManager';
 
+const API_BASE = process.env.REACT_APP_API_URL || "http://localhost:5000";
+axios.defaults.baseURL = API_BASE;
+userManager.applyAuthHeader(axios);
+
 const TopicPage = (props) => {
   const suggestionList = [
     "竞争性编程",
@@ -44,18 +48,21 @@ const TopicPage = (props) => {
   const [searchParams] = useSearchParams();
   useEffect(() => {
     const qTopic = searchParams.get('topic');
-    if (qTopic) {
-      setTopic(qTopic);
-      // 如果本地有已有设置，优先用本地值作为默认 time/knowledge
-      const topics = JSON.parse(localStorage.getItem('topics')) || {};
-      if (topics[qTopic]) {
-        setTime(topics[qTopic].time || time);
-        setTimeInput(parseInt((topics[qTopic].time || '4 周').split(' ')[0]) || timeInput);
-        setTimeUnit((topics[qTopic].time || '4 周').split(' ')[1] || timeUnit);
-        setKnowledgeLevel(topics[qTopic].knowledge_level || knowledgeLevel);
-      }
-    }
-  }, []);
+    if (!qTopic) return;
+
+    setTopic(qTopic);
+    // 如果本地有已有设置，优先用本地值作为默认 time/knowledge
+    const topics = JSON.parse(localStorage.getItem('topics')) || {};
+    if (!topics[qTopic]) return;
+
+    const savedTime = topics[qTopic].time || '4 周';
+    const parsedTime = parseInt(savedTime.split(' ')[0], 10);
+    const parsedUnit = savedTime.split(' ')[1];
+
+    setTimeInput((prev) => (Number.isFinite(parsedTime) ? parsedTime : prev));
+    setTimeUnit((prev) => parsedUnit || prev);
+    setKnowledgeLevel((prev) => topics[qTopic].knowledge_level || prev);
+  }, [searchParams]);
 
   useEffect(() => {
     setTime(timeInput + " " + timeUnit);
@@ -216,7 +223,8 @@ const TopicPage = (props) => {
           if (shouldCallApi) {
             const data = { topic, time, knowledge_level: knowledgeLevel };
             try {
-              axios.defaults.baseURL = "http://localhost:5000";
+              axios.defaults.baseURL = API_BASE;
+              userManager.applyAuthHeader(axios);
 
               // 如果是强制重新生成（来自路线页面的更改选择），先删除原有课程数据
               if (forceRegenerate) {
@@ -225,10 +233,7 @@ const TopicPage = (props) => {
                     method: 'POST',
                     url: '/api/cancel-course',
                     data: { course: topic },
-                    headers: {
-                      'Access-Control-Allow-Origin': '*',
-                      'X-User-ID': userManager.getUserId(),
-                    },
+                    withCredentials: true,
                   });
 
                   if (!(delRes.data && delRes.data.success)) {
@@ -265,11 +270,7 @@ const TopicPage = (props) => {
                 method: "POST",
                 url: "/api/roadmap",
                 data: data,
-                withCredentials: false,
-                headers: {
-                  "Access-Control-Allow-Origin": "*",
-                  "X-User-ID": userManager.getUserId(),
-                },
+                withCredentials: true,
               });
 
               topics[topic] = { time, knowledge_level: knowledgeLevel };
@@ -282,7 +283,14 @@ const TopicPage = (props) => {
               navigate(ROUTES.ROADMAP + '?topic=' + encodeURI(topic));
             } catch (error) {
               console.log(error);
-              alert("生成学习路线图时出错，请稍后重试。");
+              if (error?.response?.status === 401) {
+                alert("登录状态已失效，请重新登录后再试。");
+                navigate(ROUTES.LOGIN);
+              } else if (error?.response?.status === 429) {
+                alert("操作过于频繁，请稍后再试。");
+              } else {
+                alert("生成学习路线图时出错，请稍后重试。");
+              }
               navigate(ROUTES.HOME);
             } finally {
               setLoading(false);

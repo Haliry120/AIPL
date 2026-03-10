@@ -1,4 +1,18 @@
-from flask import Flask, request
+from flask import Flask, request, make_response, g
+import logging
+import re
+import json
+import base64
+import binascii
+import threading
+import csv
+import io
+from datetime import datetime, timedelta
+import os
+import time
+import jwt
+import uuid
+from werkzeug.security import generate_password_hash, check_password_hash
 import roadmap
 import quiz
 import generativeResources
@@ -6,41 +20,756 @@ from flask_cors import CORS
 import bilibili_search
 import translate
 from database import get_or_create_user, save_content, get_content
-import uuid
+from database import add_wrong_question, remove_wrong_question, list_wrong_questions, update_wrong_note, check_wrong_membership, add_redo_record, list_redo_records, delete_redo_record, append_wrong_redo_history
 import siliconflow_client
 
 api = Flask(__name__)
-CORS(api)
 
-def get_user_id():  
-    """从请求中获取或创建用户ID"""  
-    user_id = request.headers.get('X-User-ID')  
-    if not user_id:  
-        # 从 localStorage 或创建新的临时ID  
-        user_id = request.json.get('user_id') if request.json else None  
-      
-    user = get_or_create_user(user_id)  
-    return user['user_id'] 
+# 简易日志配置
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+USER_ID_RE = re.compile(r'^[A-Za-z0-9_\-]{1,64}$')
+
+# CORS allowlist: comma-separated origins in env, e.g. http://localhost:3000,https://app.example.com
+cors_origins_env = (os.getenv("CORS_ALLOWED_ORIGINS") or "http://localhost:3000,http://127.0.0.1:3000").strip()
+cors_origins = [origin.strip() for origin in cors_origins_env.split(",") if origin.strip()]
+CORS(api, resources={r"/api/*": {"origins": cors_origins}}, supports_credentials=True)
+
+JWT_SECRET_KEY = (os.getenv("JWT_SECRET_KEY") or "").strip()
+if not JWT_SECRET_KEY:
+    runtime_env = (os.getenv("FLASK_ENV") or os.getenv("APP_ENV") or "development").strip().lower()
+    if runtime_env == "production":
+        raise RuntimeError("JWT_SECRET_KEY is required in production environment")
+    JWT_SECRET_KEY = "dev_secret"
+    logger.warning("Using fallback JWT secret for non-production environment")
+
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRES_DAYS = int(os.getenv("JWT_EXPIRES_DAYS", "7"))
+AUTH_COOKIE_NAME = (os.getenv("AUTH_COOKIE_NAME") or "access_token").strip() or "access_token"
+AUTH_COOKIE_SAMESITE = (os.getenv("AUTH_COOKIE_SAMESITE") or "Lax").strip() or "Lax"
+
+runtime_env = (os.getenv("FLASK_ENV") or os.getenv("APP_ENV") or "development").strip().lower()
+default_cookie_secure = "true" if runtime_env == "production" else "false"
+AUTH_COOKIE_SECURE = (os.getenv("AUTH_COOKIE_SECURE", default_cookie_secure) or "false").strip().lower() in {"1", "true", "yes", "on"}
+
+PUBLIC_ENDPOINTS = {
+    "/api/health",
+    "/api/auth/register",
+    "/api/auth/login",
+    "/api/auth/logout",
+}
+
+# In-memory rate limit config (per process). Values are conservative defaults.
+RATE_LIMIT_RULES = {
+    "prompt_write": {"limit": 30, "window": 60},
+    "password_update": {"limit": 5, "window": 600},
+    "delete_account": {"limit": 3, "window": 3600},
+}
+_RATE_BUCKETS = {}
+_RATE_LOCK = threading.Lock()
+
+
+def error_response(message, status=400):
+    return {"success": False, "error": message}, status
+
+
+def _get_request_ip():
+    xff = (request.headers.get("X-Forwarded-For") or "").strip()
+    if xff:
+        return xff.split(",")[0].strip()
+    return (request.remote_addr or "unknown").strip() or "unknown"
+
+
+def _audit_security_event(event, user_id=None, status="ok", detail=None):
+    payload = {
+        "event": event,
+        "status": status,
+        "user_id": user_id,
+        "ip": _get_request_ip(),
+        "ua": (request.headers.get("User-Agent") or "").strip()[:256],
+        "time": datetime.utcnow().isoformat() + "Z",
+    }
+    if detail:
+        payload["detail"] = str(detail)[:256]
+
+    line = json.dumps(payload, ensure_ascii=False)
+    if status in {"denied", "error", "rate_limited"}:
+        logger.warning("SECURITY_AUDIT %s", line)
+    else:
+        logger.info("SECURITY_AUDIT %s", line)
+
+
+def _consume_rate_limit(action, subject):
+    cfg = RATE_LIMIT_RULES.get(action)
+    if not cfg:
+        return True, 0
+
+    now = time.time()
+    window = int(cfg.get("window", 60))
+    limit = int(cfg.get("limit", 10))
+    key = f"{action}:{subject}"
+
+    with _RATE_LOCK:
+        hits = _RATE_BUCKETS.get(key, [])
+        threshold = now - window
+        hits = [ts for ts in hits if ts >= threshold]
+
+        if len(hits) >= limit:
+            retry_after = int(max(1, window - (now - hits[0])))
+            _RATE_BUCKETS[key] = hits
+            return False, retry_after
+
+        hits.append(now)
+        _RATE_BUCKETS[key] = hits
+
+    return True, 0
+
+
+def _enforce_rate_limit(action, user_id):
+    subject = f"{user_id}:{_get_request_ip()}"
+    ok, retry_after = _consume_rate_limit(action, subject)
+    if ok:
+        return None
+
+    _audit_security_event(
+        event=f"{action}_rate_limit",
+        user_id=user_id,
+        status="rate_limited",
+        detail=f"retry_after={retry_after}s",
+    )
+    return error_response(f"Too many requests, please retry after {retry_after}s", 429)
+
+
+def get_json_body():
+    return request.get_json(silent=True) or {}
+
+
+def parse_pagination(args, default_limit=50, max_limit=100):
+    try:
+        limit = int(args.get('limit', default_limit))
+        skip = int(args.get('skip', 0))
+    except Exception:
+        limit, skip = default_limit, 0
+    limit = max(1, min(max_limit, limit))
+    skip = max(0, skip)
+    return limit, skip
+
+
+def _get_bearer_token():
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return None
+    return auth_header.replace("Bearer ", "", 1).strip()
+
+
+def _get_auth_token():
+    bearer = _get_bearer_token()
+    if bearer:
+        return bearer
+    cookie_token = (request.cookies.get(AUTH_COOKIE_NAME) or "").strip()
+    return cookie_token or None
+
+
+def _set_auth_cookie(response, token):
+    response.set_cookie(
+        AUTH_COOKIE_NAME,
+        token,
+        httponly=True,
+        secure=AUTH_COOKIE_SECURE,
+        samesite=AUTH_COOKIE_SAMESITE,
+        max_age=JWT_EXPIRES_DAYS * 24 * 60 * 60,
+        path='/',
+    )
+
+
+def _clear_auth_cookie(response):
+    response.set_cookie(
+        AUTH_COOKIE_NAME,
+        "",
+        httponly=True,
+        secure=AUTH_COOKIE_SECURE,
+        samesite=AUTH_COOKIE_SAMESITE,
+        expires=0,
+        max_age=0,
+        path='/',
+    )
+
+
+def _issue_token(user_id):
+    now = datetime.utcnow()
+    payload = {
+        "sub": user_id,
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(days=JWT_EXPIRES_DAYS)).timestamp())
+    }
+    return jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+
+
+def _decode_token(token):
+    return jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+
+
+def _normalize_user_id(raw_user_id):
+    if raw_user_id and not USER_ID_RE.match(raw_user_id):
+        logger.warning('Invalid user id format')
+        return None
+    return raw_user_id
+
+
+def get_user_id_optional():
+    """从请求中获取用户ID（若缺失则返回None）"""
+    return getattr(g, "user_id", None)
+
+
+@api.route("/api/health", methods=["GET"])
+def health():
+    """简单健康检查，包含 MongoDB ping"""
+    from mongodb import mongodb
+    db_status = "ok"
+    try:
+        mongodb.client.admin.command('ping')
+    except Exception as e:
+        db_status = f"fail: {e}"
+    return {"status": "ok", "db": db_status}
+
+def get_user_id():
+    """从请求中获取用户ID"""
+    user_id = getattr(g, "user_id", None)
+    if not user_id:
+        return None
+    return user_id
+
+
+@api.before_request
+def require_authentication():
+    if request.method == "OPTIONS":
+        return None
+    if not request.path.startswith("/api/"):
+        return None
+    if request.path in PUBLIC_ENDPOINTS:
+        return None
+
+    token = _get_auth_token()
+    if not token:
+        return error_response("Unauthorized", 401)
+
+    try:
+        payload = _decode_token(token)
+        user_id = payload.get("sub")
+        if not user_id:
+            return error_response("Unauthorized", 401)
+        from database import get_user_by_id
+        user = get_user_by_id(user_id)
+        if not user:
+            return error_response("Unauthorized", 401)
+        g.user_id = user_id
+    except jwt.ExpiredSignatureError:
+        return error_response("Token expired", 401)
+    except jwt.InvalidTokenError:
+        return error_response("Unauthorized", 401)
+
+
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_\-]{3,32}$")
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _validate_username(username):
+    if not username or not USERNAME_RE.match(username):
+        return False
+    return True
+
+
+def _validate_email(email):
+    if not email or not EMAIL_RE.match(email):
+        return False
+    return True
+
+
+def _validate_password(password):
+    if not password or len(password) < 8:
+        return False
+    has_alpha = any(c.isalpha() for c in password)
+    has_digit = any(c.isdigit() for c in password)
+    return has_alpha and has_digit
+
+
+def _parse_bool(value, default=False):
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes", "on"}:
+        return True
+    if text in {"false", "0", "no", "off", ""}:
+        return False
+    return bool(default)
+
+
+def _validate_avatar_url(avatar_url):
+    if avatar_url is None:
+        return True
+    if not isinstance(avatar_url, str):
+        return False
+    text = avatar_url.strip()
+    if text == "":
+        return True
+    if text.startswith("http://") or text.startswith("https://"):
+        return len(text) <= 512
+    if text.startswith("data:image/") and ";base64," in text:
+        if len(text) > 3000000:
+            return False
+        try:
+            header, encoded = text.split(",", 1)
+            if re.match(r"^data:image\/[A-Za-z0-9.+\-]+(?:;[A-Za-z0-9=._+\-]+)*;base64$", header) is None:
+                return False
+            compact = re.sub(r"\s+", "", encoded)
+            try:
+                base64.b64decode(compact, validate=True)
+            except binascii.Error:
+                normalized = compact.replace("-", "+").replace("_", "/")
+                padding = len(normalized) % 4
+                if padding:
+                    normalized += "=" * (4 - padding)
+                base64.b64decode(normalized, validate=False)
+            return True
+        except (ValueError, binascii.Error):
+            return False
+    return False
+
+
+def _get_avatar_validation_error(avatar_url):
+    if avatar_url is None:
+        return None
+    if not isinstance(avatar_url, str):
+        return "头像数据格式错误"
+
+    text = avatar_url.strip()
+    if text == "":
+        return None
+
+    if text.startswith("http://") or text.startswith("https://"):
+        if len(text) > 512:
+            return "头像链接过长，请缩短后重试"
+        return None
+
+    lower_text = text.lower()
+    if lower_text.startswith("data:image/") and ";base64," in lower_text:
+        if len(text) > 3000000:
+            return "头像图片过大，请选择更小的图片（建议小于2MB）"
+        try:
+            header, encoded = text.split(",", 1)
+            if re.match(r"^data:image\/[A-Za-z0-9.+\-]+(?:;[A-Za-z0-9=._+\-]+)*;base64$", header, re.IGNORECASE) is None:
+                return "头像图片格式不受支持"
+
+            compact = re.sub(r"\s+", "", encoded)
+            try:
+                base64.b64decode(compact, validate=True)
+            except binascii.Error:
+                normalized = compact.replace("-", "+").replace("_", "/")
+                padding = len(normalized) % 4
+                if padding:
+                    normalized += "=" * (4 - padding)
+                base64.b64decode(normalized, validate=False)
+            return None
+        except (ValueError, binascii.Error):
+            return "头像图片编码无效，请重新选择图片"
+
+    return "头像必须是 http(s) 链接或本地上传图片"
+
+
+@api.route("/api/auth/register", methods=["POST"])
+def register_user():
+    req = get_json_body()
+    username = (req.get("username") or "").strip()
+    email = (req.get("email") or "").strip()
+    password = req.get("password") or ""
+
+    if not _validate_username(username):
+        return error_response("Invalid username", 400)
+    if not _validate_email(email):
+        return error_response("Invalid email", 400)
+    if not _validate_password(password):
+        return error_response("Invalid password", 400)
+
+    from database import create_user, get_user_by_identifier
+
+    if get_user_by_identifier(username):
+        return error_response("Username already exists", 409)
+    if get_user_by_identifier(email):
+        return error_response("Email already exists", 409)
+
+    password_hash = generate_password_hash(password)
+    try:
+        user_id = create_user(username, email, password_hash)
+    except Exception as e:
+        logger.error("注册失败: %s", e)
+        return error_response("Registration failed", 500)
+
+    token = _issue_token(user_id)
+    payload = {
+        "success": True,
+        "token": token,
+        "user": {
+            "user_id": user_id,
+            "username": username,
+            "email": email,
+            "avatar_url": ""
+        }
+    }
+    response = make_response(payload)
+    _set_auth_cookie(response, token)
+    return response
+
+
+@api.route("/api/auth/login", methods=["POST"])
+def login_user():
+    req = get_json_body()
+    identifier = (req.get("identifier") or "").strip()
+    password = req.get("password") or ""
+
+    if not identifier or not password:
+        return error_response("Identifier and password required", 400)
+
+    from database import get_user_by_identifier, update_last_login
+    user = get_user_by_identifier(identifier)
+    if not user:
+        return error_response("Invalid credentials", 401)
+
+    if not check_password_hash(user.get("password_hash", ""), password):
+        return error_response("Invalid credentials", 401)
+
+    update_last_login(user.get("user_id"))
+    token = _issue_token(user.get("user_id"))
+    payload = {
+        "success": True,
+        "token": token,
+        "user": {
+            "user_id": user.get("user_id"),
+            "username": user.get("username"),
+            "email": user.get("email"),
+            "avatar_url": user.get("avatar_url", "")
+        }
+    }
+    response = make_response(payload)
+    _set_auth_cookie(response, token)
+    return response
+
+
+@api.route("/api/auth/logout", methods=["POST"])
+def logout_user():
+    response = make_response({"success": True})
+    _clear_auth_cookie(response)
+    return response
+
+
+@api.route("/api/auth/session", methods=["GET"])
+def auth_session():
+    user_id = get_user_id()
+    from database import get_user_by_id
+    user = get_user_by_id(user_id)
+    if not user:
+        return error_response("Unauthorized", 401)
+    return {
+        "success": True,
+        "user": {
+            "user_id": user.get("user_id"),
+            "username": user.get("username"),
+            "email": user.get("email"),
+            "avatar_url": user.get("avatar_url", ""),
+        },
+    }
+
+
+@api.route("/api/user/settings", methods=["GET"])
+def get_user_settings_api():
+    user_id = get_user_id()
+    from database import get_user_settings
+
+    try:
+        settings = get_user_settings(user_id)
+        if not settings:
+            return error_response("User not found", 404)
+        return {"success": True, "settings": settings}
+    except Exception as e:
+        logger.error("获取用户设置失败: %s", e)
+        return error_response("Failed to load settings", 500)
+
+
+@api.route("/api/user/settings", methods=["PUT"])
+def update_user_settings_api():
+    user_id = get_user_id()
+    req = get_json_body()
+    username = req.get("username")
+    avatar_url = req.get("avatar_url")
+
+    if username is not None:
+        username = str(username).strip()
+        if not _validate_username(username):
+            return error_response("Invalid username", 400)
+
+    avatar_error = _get_avatar_validation_error(avatar_url)
+    if avatar_error:
+        return error_response(avatar_error, 400)
+
+    from database import update_user_settings, get_user_by_identifier, get_user_by_id
+
+    try:
+        if username is not None:
+            exists = get_user_by_identifier(username)
+            if exists and exists.get("user_id") != user_id:
+                return error_response("Username already exists", 409)
+
+        avatar_clean = avatar_url.strip() if isinstance(avatar_url, str) else avatar_url
+        update_user_settings(user_id, username=username, avatar_url=avatar_clean)
+        user = get_user_by_id(user_id)
+        return {
+            "success": True,
+            "user": {
+                "user_id": user_id,
+                "username": user.get("username"),
+                "email": user.get("email"),
+                "avatar_url": user.get("avatar_url", ""),
+            },
+        }
+    except Exception as e:
+        logger.error("更新用户设置失败: %s", e)
+        return error_response("Failed to update settings", 500)
+
+
+@api.route("/api/user/password", methods=["PUT"])
+def update_user_password_api():
+    user_id = get_user_id()
+    limited = _enforce_rate_limit("password_update", user_id)
+    if limited:
+        return limited
+
+    req = get_json_body()
+    current_password = req.get("current_password") or ""
+    new_password = req.get("new_password") or ""
+
+    if not current_password or not new_password:
+        return error_response("Current password and new password required", 400)
+    if not _validate_password(new_password):
+        return error_response("Invalid password", 400)
+
+    from database import get_user_by_id, update_user_password_hash
+
+    try:
+        user = get_user_by_id(user_id)
+        if not user:
+            _audit_security_event("password_update", user_id=user_id, status="denied", detail="user_not_found")
+            return error_response("User not found", 404)
+
+        if not check_password_hash(user.get("password_hash", ""), current_password):
+            _audit_security_event("password_update", user_id=user_id, status="denied", detail="wrong_current_password")
+            return error_response("Current password is incorrect", 401)
+
+        update_user_password_hash(user_id, generate_password_hash(new_password))
+        _audit_security_event("password_update", user_id=user_id, status="ok")
+        return {"success": True}
+    except Exception as e:
+        _audit_security_event("password_update", user_id=user_id, status="error", detail=e)
+        logger.error("修改密码失败: %s", e)
+        return error_response("Failed to update password", 500)
+
+
+@api.route("/api/user/delete-account", methods=["POST"])
+def delete_user_account_api():
+    user_id = get_user_id()
+    limited = _enforce_rate_limit("delete_account", user_id)
+    if limited:
+        return limited
+
+    req = get_json_body()
+    password = req.get("password") or ""
+
+    if not password:
+        return error_response("Password required", 400)
+
+    from database import get_user_by_id, delete_user_account_data
+
+    try:
+        user = get_user_by_id(user_id)
+        if not user:
+            _audit_security_event("delete_account", user_id=user_id, status="denied", detail="user_not_found")
+            return error_response("User not found", 404)
+
+        if not check_password_hash(user.get("password_hash", ""), password):
+            _audit_security_event("delete_account", user_id=user_id, status="denied", detail="wrong_password")
+            return error_response("Current password is incorrect", 401)
+
+        result = delete_user_account_data(user_id)
+        _audit_security_event("delete_account", user_id=user_id, status="ok", detail=result.get("deletion_mode"))
+        return {"success": True, "result": result}
+    except Exception as e:
+        _audit_security_event("delete_account", user_id=user_id, status="error", detail=e)
+        logger.exception("注销账号失败: %s", e)
+        return error_response("Failed to delete account", 500)
+
+
+@api.route("/api/user/avatar", methods=["POST"])
+def upload_user_avatar_api():
+    user_id = get_user_id()
+
+    if "avatar" not in request.files:
+        return error_response("No avatar file provided", 400)
+
+    avatar_file = request.files.get("avatar")
+    if not avatar_file or not avatar_file.filename:
+        return error_response("Invalid avatar file", 400)
+
+    mime_type = (avatar_file.mimetype or "").strip().lower()
+    if not mime_type.startswith("image/"):
+        return error_response("Avatar must be an image", 400)
+
+    try:
+        raw_bytes = avatar_file.read()
+        if not raw_bytes:
+            return error_response("Empty avatar file", 400)
+        if len(raw_bytes) > 2 * 1024 * 1024:
+            return error_response("Avatar file too large (max 2MB)", 413)
+
+        data_url = f"data:{mime_type};base64,{base64.b64encode(raw_bytes).decode('ascii')}"
+
+        from database import update_user_settings, get_user_by_id
+
+        update_user_settings(user_id, avatar_url=data_url)
+        user = get_user_by_id(user_id)
+        return {
+            "success": True,
+            "user": {
+                "user_id": user_id,
+                "username": user.get("username"),
+                "email": user.get("email"),
+                "avatar_url": user.get("avatar_url", ""),
+            },
+        }
+    except Exception as e:
+        logger.exception("上传头像失败: %s", e)
+        return error_response(f"Avatar upload failed: {str(e)}", 500)
+
+
+@api.route("/api/user/prompts", methods=["GET"])
+def list_user_prompts_api():
+    user_id = get_user_id()
+    from database import list_prompt_templates
+
+    try:
+        prompts = list_prompt_templates(user_id)
+        return {"success": True, "prompts": prompts}
+    except Exception as e:
+        logger.error("获取提示词失败: %s", e)
+        return error_response("Failed to load prompts", 500)
+
+
+@api.route("/api/user/prompts", methods=["POST"])
+def upsert_user_prompt_api():
+    user_id = get_user_id()
+    limited = _enforce_rate_limit("prompt_write", user_id)
+    if limited:
+        return limited
+
+    req = get_json_body()
+    prompt_id = (req.get("id") or "").strip() or f"prompt_{uuid.uuid4().hex}"
+    title = (req.get("title") or "").strip()
+    content = (req.get("content") or "").strip()
+    enabled = _parse_bool(req.get("enabled"), True)
+    description = (req.get("description") or "").strip()
+    favorite = _parse_bool(req.get("favorite"), False)
+
+    raw_tags = req.get("tags", [])
+    if isinstance(raw_tags, str):
+        raw_tags = [part.strip() for part in raw_tags.split(",") if part.strip()]
+    if not isinstance(raw_tags, list):
+        raw_tags = []
+    tags = []
+    for item in raw_tags:
+        tag = str(item or "").strip()
+        if not tag:
+            continue
+        if len(tag) > 20:
+            tag = tag[:20]
+        if tag not in tags:
+            tags.append(tag)
+        if len(tags) >= 8:
+            break
+
+    if not title:
+        return error_response("Prompt title required", 400)
+    if not content:
+        return error_response("Prompt content required", 400)
+    if len(title) > 80:
+        return error_response("Prompt title too long (max 80)", 400)
+    if len(description) > 240:
+        return error_response("Prompt description too long (max 240)", 400)
+    if len(content) > 8000:
+        return error_response("Prompt content too long (max 8000)", 400)
+
+    from database import upsert_prompt_template
+
+    try:
+        saved_id = upsert_prompt_template(
+            user_id,
+            prompt_id,
+            title,
+            content,
+            enabled=enabled,
+            description=description,
+            favorite=favorite,
+            tags=tags,
+        )
+        _audit_security_event("prompt_upsert", user_id=user_id, status="ok", detail=saved_id)
+        return {"success": True, "id": saved_id}
+    except Exception as e:
+        if isinstance(e, ValueError):
+            _audit_security_event("prompt_upsert", user_id=user_id, status="denied", detail=e)
+            return error_response(str(e), 400)
+        _audit_security_event("prompt_upsert", user_id=user_id, status="error", detail=e)
+        logger.error("保存提示词失败: %s", e)
+        return error_response("Failed to save prompt", 500)
+
+
+@api.route("/api/user/prompts/<prompt_id>", methods=["DELETE"])
+def delete_user_prompt_api(prompt_id):
+    user_id = get_user_id()
+    limited = _enforce_rate_limit("prompt_write", user_id)
+    if limited:
+        return limited
+
+    from database import delete_prompt_template
+
+    if not prompt_id:
+        return error_response("Prompt id required", 400)
+
+    try:
+        modified = delete_prompt_template(user_id, prompt_id)
+        _audit_security_event("prompt_delete", user_id=user_id, status="ok", detail=f"deleted={modified}")
+        return {"success": True, "deleted": modified}
+    except Exception as e:
+        _audit_security_event("prompt_delete", user_id=user_id, status="error", detail=e)
+        logger.error("删除提示词失败: %s", e)
+        return error_response("Failed to delete prompt", 500)
 
 @api.route("/api/roadmap", methods=["POST"])
 def get_roadmap():
-    req = request.get_json()
+    req = get_json_body()
+    user_id = get_user_id_optional()
 
     # 检查是否需要重新生成
     regenerate = req.get("regenerate", False)
     topic = req.get("topic", "Machine Learning")
 
     # 如果不是重新生成，尝试从数据库获取
-    if not regenerate:
+    if not regenerate and user_id:
         try:
-            from database import get_content
-            user_id = request.headers.get('X-User-ID')
-            if user_id:
-                existing = get_content(user_id, topic, "roadmap")
-                if existing:
-                    return existing["content_data"]
-        except:
-            pass  # 如果数据库出错，继续生成新的
+            existing = get_content(user_id, topic, "roadmap")
+            if existing:
+                return existing["content_data"]
+        except Exception as e:
+            logger.error('[DBError] roadmap cache read failed: %s', e)  # 如果数据库出错，继续生成新的
 
     # 生成新的路线图
     response_body = roadmap.create_roadmap(
@@ -51,55 +780,240 @@ def get_roadmap():
 
     # 保存到数据库
     try:
-        from database import save_content
-        user_id = request.headers.get('X-User-ID')
         if user_id:
             save_content(user_id, topic, "roadmap", response_body)
-    except:
-        pass  # 如果数据库出错，仍然返回结果
+    except Exception as e:
+        logger.error('[DBError] roadmap cache save failed: %s', e)  # 如果数据库出错，仍然返回结果
 
     return response_body
 
 
 @api.route("/api/quiz", methods=["POST"])
 def get_quiz():
-    req = request.get_json()
+    req = get_json_body()
     user_id = get_user_id()
 
     course = req.get("course")
     topic = req.get("topic")
     subtopic = req.get("subtopic")
-    description = req.get("description")
+    description = req.get("description") or ""
 
-    if not (course and topic and subtopic and description):
-        return "Required Fields not provided", 400
+    # 读取用户画像（用于个性化题目）
+    user_profile = None
+    try:
+        from database import get_user_profile_db
+        profile_doc = get_user_profile_db(user_id)
+        if profile_doc:
+            user_profile = profile_doc.get('profile_data') or {}
+    except Exception as e:
+        logger.warning('获取用户画像失败，将生成通用测验: %s', e)
 
-    # 生成测验（测验通常不需要缓存，每次都是新的）
-    response_body = quiz.get_quiz(course, topic, subtopic, description)
+    # 兼容空描述，使用子主题或主题作为描述
+    if not description:
+        description = subtopic or topic or ""
+
+    if not (course and topic and subtopic):
+        return error_response("Required Fields not provided", 400)
+
+    # 生成测验
+    response_body = quiz.get_quiz(course, topic, subtopic, description, user_profile=user_profile)
     return response_body
 
-@api.route("/api/quiz-score", methods=["POST"])  
-def save_quiz_score():  
-    """保存测验成绩"""  
-    req = request.get_json()  
-    user_id = get_user_id()  
-      
-    topic = req.get("topic")  
-    score = req.get("score")  
-      
-    if not topic or score is None:  
-        return "Required Fields not provided", 400  
-      
-    from database import update_quiz_score  
-    update_quiz_score(user_id, topic, score)  
-      
-    return {"success": True}  
+@api.route("/api/quiz-score", methods=["POST"])
+def save_quiz_score():
+    """保存测验成绩"""
+    req = get_json_body()
+    user_id = get_user_id()
+
+    topic = req.get("topic")
+    score = req.get("score")
+
+    if not topic or score is None:
+        return error_response("Required Fields not provided", 400)
+
+    from database import update_quiz_score
+    update_quiz_score(user_id, topic, score)
+
+    return {"success": True}
+
+
+@api.route("/api/evaluate-question", methods=["POST"])
+def evaluate_question():
+    """评估单个题目的分数"""
+    req = get_json_body()
+    user_id = get_user_id()
+
+    question = req.get("question")
+    user_answer = req.get("user_answer")
+
+    if not (question and user_answer is not None):
+        return error_response("Required Fields not provided", 400)
+
+    try:
+        # 从question对象中提取必要信息
+        course = question.get("course", "未知课程")
+        topic = question.get("topic", "未知主题")
+        subtopic = question.get("subtopic", "未知子主题")
+        question_type = question.get("type", "short_answer")
+        
+        result = quiz.evaluate_question_score(course, topic, subtopic, question, user_answer, question_type)
+        return {"success": True, "evaluation": result}
+    except Exception as e:
+        logger.error('评估题目失败: %s', e)
+        return error_response(str(e), 500)
+
+
+def _async_finalize_quiz(record_id, user_id, course, week, subtopic, record):
+    """后台完成评分、错题归档与画像更新"""
+    try:
+        logger.info('后台评分开始: record_id=%s user=%s course=%s week=%s subtopic=%s', record_id, user_id, course, week, subtopic)
+        questions = record.get('questions', [])
+        user_answers = record.get('userAnswers', {})
+
+        question_scores = {}
+        total_score = 0
+
+        for idx, q in enumerate(questions):
+            qid = str(idx)
+            question_type = q.get('type', 'short_answer')
+            ua_entry = user_answers.get(qid) or user_answers.get(idx)
+
+            if question_type in ['single_choice', 'multiple_choice', 'true_false']:
+                selected = ua_entry.get('selectedOptions', []) if ua_entry else []
+            else:
+                user_answer_text = ua_entry.get('text', '') if ua_entry else ''
+
+            try:
+                evaluation_result = quiz.evaluate_question_score(
+                    course=course,
+                    topic=q.get('topic', ''),
+                    subtopic=subtopic,
+                    question=q,
+                    user_answer=selected if question_type in ['single_choice', 'multiple_choice', 'true_false'] else user_answer_text,
+                    question_type=question_type
+                )
+
+                question_scores[qid] = {
+                    'score': evaluation_result.get('score', 0),
+                    'is_correct': evaluation_result.get('is_correct', False),
+                    'question_type': question_type,
+                    'feedback': evaluation_result.get('feedback', '')
+                }
+                total_score += evaluation_result.get('score', 0)
+            except Exception as e:
+                logger.error('评估题目 %s 失败: %s', qid, e)
+                question_scores[qid] = {
+                    'score': 0,
+                    'is_correct': False,
+                    'question_type': question_type,
+                    'error': str(e)
+                }
+
+        record['question_scores'] = question_scores
+        record['total_score'] = total_score
+        record['max_possible_score'] = len(questions) * 10
+        record['score_percentage'] = (total_score / (len(questions) * 10)) * 100 if questions else 0
+
+        score_info = {
+            "total_score": record.get('total_score', 0),
+            "max_possible_score": record.get('max_possible_score', 0),
+            "score_percentage": record.get('score_percentage', 0),
+            "question_count": len(questions),
+            "question_scores": question_scores,
+        }
+
+        from database import update_quiz_record, update_profile_on_quiz_completion
+        update_quiz_record(record_id, record, score_info)
+        try:
+            update_profile_on_quiz_completion(user_id, record_id)
+        except Exception as e:
+            logger.warning('更新用户画像失败: %s', e)
+
+        # 自动将错误的选择题加入错题集
+        def normalize_options(q):
+            opts = q.get('options')
+            if not opts:
+                return []
+            if isinstance(opts, list):
+                return [str(o) for o in opts]
+            if isinstance(opts, str):
+                lines = [l.strip() for l in opts.split('\n') if l.strip()]
+                if len(lines) > 1:
+                    return lines
+                parts = [p.strip() for p in re.split('[,;]', opts) if p.strip()]
+                if len(parts) > 1:
+                    return parts
+                return [opts]
+            return []
+
+        def parse_correct_indices(q, opts):
+            raw = q.get('correctAnswer') if 'correctAnswer' in q else (q.get('answerIndex') if 'answerIndex' in q else q.get('answer'))
+            out = []
+            if raw is None:
+                return out
+            def push(val):
+                if isinstance(val, int):
+                    if 0 <= val < len(opts):
+                        out.append(val)
+                elif isinstance(val, str):
+                    s = val.strip()
+                    if not s:
+                        return
+                    if re.match('^[A-Za-z]', s):
+                        idx = ord(s[0].upper()) - 65
+                        if 0 <= idx < len(opts):
+                            out.append(idx)
+                            return
+                    found = next((i for i,o in enumerate(opts) if o and (o.strip() == s or o.strip().startswith(s) or s.startswith(o.strip()))), None)
+                    if found is not None:
+                        out.append(found)
+            if isinstance(raw, list):
+                for r in raw:
+                    push(r)
+            else:
+                push(raw)
+            return list(dict.fromkeys(out))
+
+        for idx, q in enumerate(questions):
+            opts = normalize_options(q)
+            if not opts:
+                continue
+            ua_entry = user_answers.get(str(idx)) or user_answers.get(idx)
+            if not ua_entry:
+                continue
+            selected = ua_entry.get('selectedOptions') or []
+            correct_indices = parse_correct_indices(q, opts)
+            if not correct_indices:
+                continue
+            if set(selected) == set(correct_indices):
+                continue
+            try:
+                user_answer_text = ', '.join([opts[i] for i in selected if 0 <= i < len(opts)]) if selected else (ua_entry.get('text') or '')
+                correct_answer_text = ', '.join([opts[i] for i in correct_indices if 0 <= i < len(opts)])
+                add_wrong_question(
+                    user_id,
+                    course,
+                    week,
+                    subtopic,
+                    q,
+                    user_answer=user_answer_text,
+                    correct_answer=correct_answer_text,
+                    difficulty=q.get('difficulty'),
+                    source='auto',
+                    note=None
+                )
+            except Exception as e:
+                logger.error('写入错题失败: %s', e)
+    except Exception as e:
+        logger.error('后台评分失败: %s', e)
+    finally:
+        logger.info('后台评分结束: record_id=%s', record_id)
 
 
 @api.route("/api/save-quiz-record", methods=["POST"])
 def save_quiz_record():
     """保存单次测验的完整记录到数据库"""
-    req = request.get_json()
+    req = get_json_body()
     user_id = get_user_id()
 
     course = req.get('course')
@@ -108,16 +1022,40 @@ def save_quiz_record():
     record = req.get('record')
 
     if not (course and week and subtopic and record is not None):
-        return "Required Fields not provided", 400
+        return error_response("Required Fields not provided", 400)
 
-    from database import save_quiz_record as db_save
+    # 轻量结构校验：要求存在 questions 数组
+    if not isinstance(record, dict) or not isinstance(record.get('questions', []), list):
+        return {"success": False, "error": "Invalid record: questions must be a list"}, 400
+
+    # 体积限制，避免超大文档
     try:
-        print(f"保存测验记录: user={user_id} course={course} week={week} subtopic={subtopic} questions={len(record.get('questions',[]))}")
-        db_save(user_id, course, week, subtopic, record)
-        return {"success": True}
+        record_size = len(json.dumps(record, ensure_ascii=False))
+        if record_size > 524288:  # 512KB
+            return {"success": False, "error": "Record too large"}, 413
+    except Exception:
+        pass
+
+    try:
+        questions = record.get('questions', [])
+        user_answers = record.get('userAnswers', {})
+        completed = bool(record.get('completedAt'))
+
+        from database import save_quiz_record as db_save
+        logger.info("保存测验记录: user=%s course=%s week=%s subtopic=%s questions=%s", user_id, course, week, subtopic, len(questions))
+        record_id = db_save(user_id, course, week, subtopic, record)
+
+        if completed:
+            threading.Thread(
+                target=_async_finalize_quiz,
+                args=(record_id, user_id, course, week, subtopic, record),
+                daemon=True
+            ).start()
+
+        return {"success": True, "record_id": record_id, "scoring_started": completed}
     except Exception as e:
-        print('保存测验记录失败:', e)
-        return {"success": False, "error": str(e)}, 500
+        logger.error('保存测验记录失败: %s', e)
+        return error_response(str(e), 500)
 
 
 @api.route("/api/quiz-records", methods=["GET"])
@@ -127,22 +1065,26 @@ def get_quiz_records():
     course = request.args.get('course')
     week = str(request.args.get('week')) if request.args.get('week') is not None else None
     subtopic = str(request.args.get('subtopic')) if request.args.get('subtopic') is not None else None
+    # 分页参数
+    limit, skip = parse_pagination(request.args)
 
     from database import get_quiz_records as db_get
+    from database import count_quiz_records as db_count
     try:
-        print(f"查询测验记录: user={user_id} course={course} week={week} subtopic={subtopic}")
-        records = db_get(user_id, course=course, week=week, subtopic=subtopic)
-        print(f"返回记录数: {len(records)}")
-        return {"success": True, "records": records}
+        logger.info(f"查询测验记录: user={user_id} course={course} week={week} subtopic={subtopic} limit={limit} skip={skip}")
+        records = db_get(user_id, course=course, week=week, subtopic=subtopic, limit=limit, skip=skip)
+        total = db_count(user_id, course=course, week=week, subtopic=subtopic)
+        logger.info(f"返回记录数: {len(records)} total={total}")
+        return {"success": True, "records": records, "pagination": {"total": total, "limit": limit, "skip": skip}}
     except Exception as e:
-        print('获取测验记录失败:', e)
+        logger.error('获取测验记录失败: %s', e)
         return {"success": False, "error": str(e)}, 500
 
 
 @api.route("/api/delete-quiz-records", methods=["POST"])
 def delete_quiz_records():
     """删除用户的测验记录；可按 course/week/subtopic 过滤"""
-    req = request.get_json() or {}
+    req = get_json_body()
     user_id = get_user_id()
     course = req.get('course')
     week = str(req.get('week')) if req.get('week') is not None else None
@@ -150,38 +1092,42 @@ def delete_quiz_records():
 
     from database import delete_quiz_records as db_delete
     try:
-        print(f"删除测验记录: user={user_id} course={course} week={week} subtopic={subtopic}")
+        logger.info("删除测验记录: user=%s course=%s week=%s subtopic=%s", user_id, course, week, subtopic)
         result = db_delete(user_id, course=course, week=week, subtopic=subtopic)
         return {"success": True, "deleted": result.get("deleted_count", 0)}
     except Exception as e:
-        print('删除测验记录失败:', e)
+        logger.error('删除测验记录失败: %s', e)
         return {"success": False, "error": str(e)}, 500
 
 
-@api.route("/api/user-data", methods=["GET"])  
-def get_user_data():  
-    """获取用户的所有学习数据"""  
-    user_id = get_user_id()  
-      
-    # 获取用户的所有内容  
-    from database import get_user_contents  
-    contents = get_user_contents(user_id)  
-      
-    return {  
-        "user_id": user_id,  
-        "contents": contents  
+@api.route("/api/user-data", methods=["GET"])
+def get_user_data():
+    """获取用户的所有学习数据"""
+    user_id = get_user_id()
+    # 分页参数（可选）
+    limit, skip = parse_pagination(request.args)
+
+    # 获取用户的所有内容
+    from database import get_user_contents, count_user_contents
+    contents = get_user_contents(user_id, limit=limit, skip=skip)
+    total = count_user_contents(user_id)
+
+    return {
+        "user_id": user_id,
+        "contents": contents,
+        "pagination": {"total": total, "limit": limit, "skip": skip}
     }
 
 
-@api.route("/api/cancel-course", methods=["POST"])  
+@api.route("/api/cancel-course", methods=["POST"])
 def cancel_course():
     """取消学习某课程并删除数据库中与该课程相关的所有数据"""
-    req = request.get_json()
+    req = get_json_body()
     user_id = get_user_id()
 
     topic = req.get("course") or req.get("topic")
     if not topic:
-        return {"error": "Required Fields not provided"}, 400
+        return error_response("Required Fields not provided", 400)
 
     from database import cancel_course as db_cancel
     result = db_cancel(user_id, topic)
@@ -190,19 +1136,22 @@ def cancel_course():
 
 @api.route("/api/translate", methods=["POST"])
 def get_translations():
-    req = request.get_json()
+    req = get_json_body()
 
     text = req.get("textArr")
     toLang = req.get("toLang")
 
-    print(f"Translating to {toLang}: { text}")
+    if not text or not toLang:
+        return error_response("Required Fields not provided", 400)
+
+    logger.info(f"Translating to {toLang}: { text}")
     translated_text = translate.translate_text_arr(text_arr=text, target=toLang)
     return translated_text
 
 
 @api.route("/api/generate-resource", methods=["POST"])
 def generative_resource():
-    req = request.get_json()
+    req = get_json_body()
     user_id = get_user_id()
 
     # 检查是否需要重新生成
@@ -211,9 +1160,12 @@ def generative_resource():
 
     if not regenerate:
         # 尝试从数据库获取现有资源
-        existing = get_content(user_id, course, "resource")
-        if existing:
-            return existing["content_data"]
+        try:
+            existing = get_content(user_id, course, "resource")
+            if existing:
+                return existing["content_data"]
+        except Exception as e:
+            logger.error('[DBError] resource cache read failed: %s', e)
 
     # 验证必需字段
     req_data = {
@@ -225,20 +1177,23 @@ def generative_resource():
 
     for key, value in req_data.items():
         if not value:
-            return "Required Fields not provided", 400
+            return error_response("Required Fields not provided", 400)
     
     # 生成新的资源
     resources = generativeResources.generate_resources(**req_data)
 
     # 保存到数据库
-    save_content(user_id, course, "resource", resources)
+    try:
+        save_content(user_id, course, "resource", resources)
+    except Exception as e:
+        logger.error('[DBError] resource cache save failed: %s', e)
 
     return resources
 
 
 @api.route("/api/search-bilibili", methods=["POST"])
 def search_bilibili():
-    req = request.get_json()
+    req = get_json_body()
 
     subtopic = req.get("subtopic", "")
     course = req.get("course", "")
@@ -247,36 +1202,616 @@ def search_bilibili():
     try:
         subtopic_cn = translate.translate_text_arr([subtopic], target="zh-CN")[0] if subtopic else ""
         course_cn = translate.translate_text_arr([course], target="zh-CN")[0] if course else ""
-        print(f"Translated: {subtopic} -> {subtopic_cn}, {course} -> {course_cn}")
+        logger.info("Translated: %s -> %s, %s -> %s", subtopic, subtopic_cn, course, course_cn)
     except Exception as e:
-        print(f"Translation error: {e}, using original keywords")
+        logger.warning("Translation error: %s, using original keywords", e)
         subtopic_cn = subtopic
         course_cn = course
 
         # 使用翻译后的中文关键词搜索
     keyword = f"{subtopic_cn} 教程"
 
-    print(f"Searching Bilibili for: {keyword}")
+    logger.info("Searching Bilibili for: %s", keyword)
     courses = bilibili_search.search_bilibili_courses(keyword)
 
     # 如果第一次搜索无结果,尝试其他组合
     if not courses:
-        print(f"No results for '{keyword}', trying with course name")
+        logger.info("No results for '%s', trying with course name", keyword)
         keyword = f"{course_cn} {subtopic_cn}"
         courses = bilibili_search.search_bilibili_courses(keyword)
 
     if not courses:
-        print(f"No results for '{keyword}', trying with course only")
+        logger.info("No results for '%s', trying with course only", keyword)
         keyword = f"{course_cn}"
         courses = bilibili_search.search_bilibili_courses(keyword)
 
     return {"courses": courses, "keyword": keyword}
 
 
+# -------------------- 错题集与重做 --------------------
+
+@api.route("/api/wrong-questions", methods=["GET"])
+def list_wrong_questions_route():
+    user_id = get_user_id()
+    course = request.args.get('course')
+    week = request.args.get('week')
+    subtopic = request.args.get('subtopic')
+    difficulty = request.args.get('difficulty')
+    try:
+        docs = list_wrong_questions(user_id, course=course, week=week, subtopic=subtopic, difficulty=difficulty)
+        return {"success": True, "records": docs}
+    except Exception as e:
+        logger.error('获取错题集失败: %s', e)
+        return error_response(str(e), 500)
+
+
+@api.route("/api/wrong-questions/toggle", methods=["POST"])
+def toggle_wrong_question_route():
+    from mongodb import mongodb  # 复用统一的 key 生成逻辑
+
+    user_id = get_user_id()
+    data = get_json_body()
+    course = data.get('course')
+    week = data.get('week')
+    subtopic = data.get('subtopic')
+    question = data.get('question')
+    user_answer = data.get('user_answer')
+    correct_answer = data.get('correct_answer')
+    difficulty = data.get('difficulty')
+
+    if not (course and week is not None and subtopic is not None and question):
+        return error_response("Required Fields not provided", 400)
+
+    try:
+        qkey = mongodb._question_key(question, course, str(week), str(subtopic))
+        exists = check_wrong_membership(user_id, [question], course, str(week), str(subtopic))
+        if exists:
+            removed = remove_wrong_question(user_id, qkey)
+            return {"success": True, "inWrong": False, "deleted": removed, "question_key": qkey}
+        else:
+            added_key = add_wrong_question(user_id, course, str(week), str(subtopic), question, user_answer, correct_answer, difficulty, source='manual')
+            return {"success": True, "inWrong": True, "question_key": added_key}
+    except Exception as e:
+        logger.error('切换错题状态失败: %s', e)
+        return error_response(str(e), 500)
+
+
+@api.route("/api/wrong-questions/note", methods=["POST"])
+def update_wrong_note_route():
+    user_id = get_user_id()
+    data = get_json_body()
+    qkey = data.get('question_key')
+    note = data.get('note', '')
+    if not qkey:
+        return error_response("question_key required", 400)
+    try:
+        modified = update_wrong_note(user_id, qkey, note)
+        return {"success": True, "modified": modified}
+    except Exception as e:
+        logger.error('更新错题笔记失败: %s', e)
+        return error_response(str(e), 500)
+
+
+@api.route("/api/wrong-questions/delete", methods=["POST"])
+def delete_wrong_question_route():
+    user_id = get_user_id()
+    data = get_json_body()
+    qkey = data.get('question_key')
+    if not qkey:
+        return error_response("question_key required", 400)
+    try:
+        deleted = remove_wrong_question(user_id, qkey)
+        return {"success": True, "deleted": deleted}
+    except Exception as e:
+        logger.error('删除错题失败: %s', e)
+        return error_response(str(e), 500)
+
+
+@api.route("/api/wrong-questions/check", methods=["POST"])
+def check_wrong_membership_route():
+    user_id = get_user_id()
+    data = get_json_body()
+    course = data.get('course')
+    week = data.get('week')
+    subtopic = data.get('subtopic')
+    questions = data.get('questions') or []
+    if not (course and week is not None and subtopic is not None and isinstance(questions, list)):
+        return error_response("Required Fields not provided", 400)
+    try:
+        indices = check_wrong_membership(user_id, questions, course, str(week), str(subtopic))
+        return {"success": True, "indices": indices}
+    except Exception as e:
+        logger.error('检查错题 membership 失败: %s', e)
+        return error_response(str(e), 500)
+
+
+@api.route("/api/redo-records", methods=["POST"])
+def create_redo_records_route():
+    user_id = get_user_id()
+    data = get_json_body()
+    course = data.get('course')
+    week = data.get('week')
+    subtopic = data.get('subtopic')
+    items = data.get('items') or []
+    batch_id = data.get('batch_id')
+    if not (course and week is not None and subtopic is not None and isinstance(items, list) and items):
+        return error_response("Required Fields not provided", 400)
+    ids = []
+    try:
+        for it in items:
+            raw_q = it.get('question')
+            # 兼容 question 传入字符串（仅题干）的情况
+            q = raw_q if isinstance(raw_q, dict) else ({'question': raw_q} if raw_q else {})
+            cid = add_redo_record(
+                user_id,
+                course,
+                str(week),
+                str(subtopic),
+                q,
+                it.get('correct_answer'),
+                it.get('attempt_answer'),
+                it.get('difficulty'),
+                batch_id,
+                it.get('question_key')
+            )
+            ids.append(cid)
+        return {"success": True, "ids": ids}
+    except Exception as e:
+        logger.error('创建重做记录失败: %s', e)
+        return error_response(str(e), 500)
+
+
+@api.route("/api/redo-records", methods=["GET"])
+def list_redo_records_route():
+    user_id = get_user_id()
+    course = request.args.get('course')
+    week = request.args.get('week')
+    subtopic = request.args.get('subtopic')
+    try:
+        docs = list_redo_records(user_id, course=course, week=week, subtopic=subtopic)
+        return {"success": True, "records": docs}
+    except Exception as e:
+        logger.error('获取重做记录失败: %s', e)
+        return error_response(str(e), 500)
+
+
+@api.route("/api/redo-records/<record_id>", methods=["DELETE"])
+def delete_redo_record_route(record_id):
+    user_id = get_user_id()
+    try:
+        deleted = delete_redo_record(user_id, record_id)
+        return {"success": True, "deleted": deleted}
+    except Exception as e:
+        logger.error('删除重做记录失败: %s', e)
+        return error_response(str(e), 500)
+
+
+@api.route("/api/wrong-questions/redo-log", methods=["POST"])
+def append_wrong_redo_history_route():
+    """为错题追加一条重做记录（不进入重做列表，最多20条，先进先出）。"""
+    user_id = get_user_id()
+    data = get_json_body()
+    qkey = data.get('question_key')
+    attempt_answer = data.get('attempt_answer')
+    correct_answer = data.get('correct_answer')
+    difficulty = data.get('difficulty')
+    if not qkey or attempt_answer is None:
+        return error_response("question_key and attempt_answer required", 400)
+    try:
+        modified = append_wrong_redo_history(user_id, qkey, attempt_answer, correct_answer, difficulty)
+        return {"success": True, "modified": modified}
+    except Exception as e:
+        logger.error('追加重做记录失败: %s', e)
+        return error_response(str(e), 500)
+
+
+@api.route("/api/user-profile", methods=["GET"])
+def get_user_profile_api():
+    """获取用户画像（必要时生成）"""
+    user_id = get_user_id()
+    regenerate = str(request.args.get('regenerate', '0')).lower() in ['1', 'true', 'yes']
+
+    from database import get_user_profile_db, generate_user_profile
+
+    profile_doc = None
+    if not regenerate:
+        try:
+            profile_doc = get_user_profile_db(user_id)
+        except Exception as e:
+            logger.warning('获取用户画像失败，将尝试重新生成: %s', e)
+
+    if regenerate or not profile_doc:
+        result = generate_user_profile(user_id)
+        if not result or not result.get('success'):
+            return {"success": False, "error": result.get('error') if result else 'profile generation failed'}, 500
+        return {
+            "success": True,
+            "profile": result.get('profile', {}),
+            "generated_at": result.get('generated_at')
+        }
+
+    profile_data = profile_doc.get('profile_data') or {}
+    return {
+        "success": True,
+        "profile": profile_data,
+        "meta": {
+            "created_at": profile_doc.get('created_at'),
+            "updated_at": profile_doc.get('updated_at'),
+            "profile_version": profile_doc.get('profile_version')
+        }
+    }
+
+
+@api.route("/api/user-profile/refresh", methods=["POST"])
+def refresh_user_profile():
+    """强制刷新用户画像"""
+    user_id = get_user_id()
+    
+    try:
+        from database import generate_user_profile
+        result = generate_user_profile(user_id)
+        
+        if result.get('success'):
+            return {
+                "success": True,
+                "message": "用户画像已更新",
+                "profile": result.get('profile')
+            }
+        else:
+            return error_response(result.get('error', '更新失败'), 500)
+            
+    except Exception as e:
+        logger.error('刷新用户画像失败: %s', e)
+        return error_response(str(e), 500)
+
+
+@api.route("/api/user-profile/summary", methods=["GET"])
+def get_profile_summary():
+    """获取简化的用户画像摘要（用于仪表板）"""
+    user_id = get_user_id()
+    
+    try:
+        from database import get_user_profile_db
+        profile_doc = get_user_profile_db(user_id)
+        
+        if not profile_doc:
+            return {"success": True, "summary": {"has_profile": False}}
+        
+        profile = profile_doc.get('profile_data', {})
+        
+        # 提取关键指标
+        summary = {
+            "has_profile": True,
+            "learning_activity": {
+                "total_quizzes": profile.get('learning_activity', {}).get('total_quizzes', 0),
+                "recent_activity": profile.get('learning_activity', {}).get('recent_activity', 'unknown'),
+                "quiz_frequency": profile.get('learning_activity', {}).get('quiz_frequency', 'unknown')
+            },
+            "knowledge_mastery": {
+                "overall_score": profile.get('knowledge_mastery', {}).get('overall_score', 0),
+                "improvement_trend": profile.get('knowledge_mastery', {}).get('improvement_trend', 'unknown'),
+                "strong_areas_count": len(profile.get('knowledge_mastery', {}).get('strong_areas', [])),
+                "weak_areas_count": len(profile.get('knowledge_mastery', {}).get('weak_areas', []))
+            },
+            "learning_effectiveness": {
+                "error_rate": profile.get('learning_effectiveness', {}).get('error_rate', 0),
+                "effectiveness_level": profile.get('learning_effectiveness', {}).get('effectiveness_level', 'unknown')
+            },
+            "recommendations_count": len(profile.get('personalized_recommendations', [])),
+            "last_updated": profile_doc.get('updated_at')
+        }
+        
+        return {"success": True, "summary": summary}
+        
+    except Exception as e:
+        logger.error('获取画像摘要失败: %s', e)
+        # 返回基础信息
+        return {
+            "success": True,
+            "summary": {
+                "has_profile": False,
+                "message": "用户画像正在生成中..."
+            }
+        }
+
+
+@api.route("/api/user-profile/subjects-overview", methods=["GET"])
+def get_subjects_overview_api():
+    user_id = get_user_id()
+    search_text = request.args.get("q")
+    sort_mode = (request.args.get("sort") or "recent").strip().lower()
+    if sort_mode not in ["recent", "custom"]:
+        sort_mode = "recent"
+
+    try:
+        from database import get_subjects_overview
+        subjects = get_subjects_overview(user_id, search_text=search_text, sort_mode=sort_mode)
+        return {"success": True, "subjects": subjects}
+    except Exception as e:
+        logger.error("获取学科总览失败: %s", e)
+        return error_response(str(e), 500)
+
+
+@api.route("/api/user-profile/subjects-order", methods=["POST"])
+def set_subjects_order_api():
+    user_id = get_user_id()
+    data = get_json_body()
+    order = data.get("order") or []
+    if not isinstance(order, list):
+        return error_response("order must be a list", 400)
+
+    try:
+        from database import set_subject_order
+        saved = set_subject_order(user_id, order)
+        return {"success": True, "order": saved}
+    except Exception as e:
+        logger.error("保存学科排序失败: %s", e)
+        return error_response(str(e), 500)
+
+
+@api.route("/api/user-profile/subject-detail", methods=["GET"])
+def get_subject_detail_api():
+    user_id = get_user_id()
+    subject = (request.args.get("subject") or "").strip()
+    if not subject:
+        return error_response("subject required", 400)
+
+    try:
+        from database import get_subject_detail
+        detail = get_subject_detail(user_id, subject)
+        return {"success": True, "detail": detail}
+    except Exception as e:
+        logger.error("获取学科详情失败: %s", e)
+        return error_response(str(e), 500)
+
+
+def _append_csv_row(rows, section, key, value):
+    rows.append({
+        "section": section,
+        "key": key,
+        "value": value
+    })
+
+
+def _profile_to_csv(profile):
+    rows = []
+
+    activity = profile.get("learning_activity", {})
+    mastery = profile.get("knowledge_mastery", {})
+    preferences = profile.get("learning_preferences", {})
+    effectiveness = profile.get("learning_effectiveness", {})
+    recommendations = profile.get("personalized_recommendations", [])
+
+    for key, value in activity.items():
+        _append_csv_row(rows, "learning_activity", key, value)
+
+    for key, value in mastery.items():
+        if isinstance(value, (list, dict)):
+            value = json.dumps(value, ensure_ascii=False)
+        _append_csv_row(rows, "knowledge_mastery", key, value)
+
+    for key, value in preferences.items():
+        if isinstance(value, (list, dict)):
+            value = json.dumps(value, ensure_ascii=False)
+        _append_csv_row(rows, "learning_preferences", key, value)
+
+    for key, value in effectiveness.items():
+        if isinstance(value, (list, dict)):
+            value = json.dumps(value, ensure_ascii=False)
+        _append_csv_row(rows, "learning_effectiveness", key, value)
+
+    for idx, rec in enumerate(recommendations):
+        rec_key = f"recommendation_{idx + 1}"
+        rec_value = json.dumps(rec, ensure_ascii=False)
+        _append_csv_row(rows, "personalized_recommendations", rec_key, rec_value)
+
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=["section", "key", "value"])
+    writer.writeheader()
+    writer.writerows(rows)
+    return output.getvalue()
+
+
+def _parse_profile_value(raw_value):
+    if raw_value is None:
+        return None
+
+    if isinstance(raw_value, (dict, list, int, float, bool)):
+        return raw_value
+
+    text = str(raw_value).strip()
+    if text == "":
+        return ""
+
+    lowered = text.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    if lowered == "null":
+        return None
+
+    if re.fullmatch(r"-?\d+", text):
+        try:
+            return int(text)
+        except Exception:
+            pass
+
+    if re.fullmatch(r"-?\d+\.\d+", text):
+        try:
+            return float(text)
+        except Exception:
+            pass
+
+    if text.startswith("{") or text.startswith("["):
+        try:
+            return json.loads(text)
+        except Exception:
+            return text
+
+    return text
+
+
+def _csv_to_profile(csv_text):
+    reader = csv.DictReader(io.StringIO(csv_text))
+    expected = {"section", "key", "value"}
+    found = set(reader.fieldnames or [])
+    if not expected.issubset(found):
+        raise ValueError("CSV 需要包含列: section,key,value")
+
+    profile = {}
+    recommendation_items = []
+    row_count = 0
+
+    for row in reader:
+        row_count += 1
+        section = str((row.get("section") or "")).strip()
+        key = str((row.get("key") or "")).strip()
+        value = _parse_profile_value(row.get("value"))
+
+        if not section:
+            continue
+
+        if section == "personalized_recommendations":
+            if isinstance(value, dict):
+                recommendation_items.append(value)
+            elif value is not None and str(value).strip() != "":
+                recommendation_items.append({"content": value})
+            continue
+
+        if not key:
+            continue
+
+        if section not in profile or not isinstance(profile.get(section), dict):
+            profile[section] = {}
+        profile[section][key] = value
+
+    if recommendation_items:
+        profile["personalized_recommendations"] = recommendation_items
+
+    profile.setdefault("analysis_date", datetime.utcnow().isoformat())
+    if "profile_version" not in profile:
+        profile["profile_version"] = 1
+
+    return profile, row_count
+
+
+@api.route("/api/user-profile/export", methods=["GET"])
+def export_user_profile():
+    """导出用户画像统计特征（CSV/JSON）"""
+    user_id = get_user_id()
+    export_format = str(request.args.get("format", "csv")).lower()
+    regenerate = str(request.args.get("regenerate", "0")).lower() in ["1", "true", "yes"]
+
+    from database import get_user_profile_db, generate_user_profile
+
+    profile_doc = None
+    if not regenerate:
+        try:
+            profile_doc = get_user_profile_db(user_id)
+        except Exception as e:
+            logger.warning("获取用户画像失败，将尝试重新生成: %s", e)
+
+    if regenerate or not profile_doc:
+        result = generate_user_profile(user_id)
+        if not result or not result.get("success"):
+            return {"success": False, "error": result.get("error") if result else "profile generation failed"}, 500
+        profile_data = result.get("profile", {})
+        meta = {"generated_at": result.get("generated_at")}
+    else:
+        profile_data = profile_doc.get("profile_data") or {}
+        meta = {
+            "created_at": profile_doc.get("created_at"),
+            "updated_at": profile_doc.get("updated_at"),
+            "profile_version": profile_doc.get("profile_version")
+        }
+
+    if export_format == "json":
+        return {"success": True, "profile": profile_data, "meta": meta}
+
+    csv_body = _profile_to_csv(profile_data)
+    filename = f"user_profile_stats_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+    response = make_response(csv_body)
+    response.headers["Content-Type"] = "text/csv; charset=utf-8"
+    response.headers["Content-Disposition"] = f"attachment; filename={filename}"
+    return response
+
+
+@api.route("/api/user-profile/import", methods=["POST"])
+def import_user_profile():
+    """导入用户画像统计特征（CSV/JSON）"""
+    user_id = get_user_id()
+
+    upload = request.files.get("file")
+    if not upload:
+        return error_response("请上传 CSV 或 JSON 文件", 400)
+
+    filename = str(upload.filename or "").strip().lower()
+    try:
+        payload_bytes = upload.read()
+    except Exception:
+        return error_response("读取上传文件失败", 400)
+
+    if not payload_bytes:
+        return error_response("上传文件为空", 400)
+    if len(payload_bytes) > 1024 * 1024:
+        return error_response("文件过大，请上传 1MB 以内文件", 413)
+
+    try:
+        text = payload_bytes.decode("utf-8-sig")
+    except Exception:
+        return error_response("文件编码不支持，请使用 UTF-8", 400)
+
+    try:
+        if filename.endswith(".json"):
+            obj = json.loads(text)
+            if isinstance(obj, dict) and isinstance(obj.get("profile"), dict):
+                profile_data = obj.get("profile")
+            elif isinstance(obj, dict):
+                profile_data = obj
+            else:
+                return error_response("JSON 格式无效，需为对象", 400)
+            imported_rows = 1
+        else:
+            profile_data, imported_rows = _csv_to_profile(text)
+    except ValueError as ve:
+        return error_response(str(ve), 400)
+    except json.JSONDecodeError:
+        return error_response("JSON 解析失败，请检查文件内容", 400)
+    except Exception as e:
+        logger.error("解析导入文件失败: %s", e)
+        return error_response("导入文件解析失败", 400)
+
+    if not isinstance(profile_data, dict) or not profile_data:
+        return error_response("导入内容为空或格式不正确", 400)
+
+    profile_data["analysis_date"] = datetime.utcnow().isoformat()
+    if not isinstance(profile_data.get("profile_version"), int):
+        profile_data["profile_version"] = 1
+
+    try:
+        from database import save_user_profile_db
+        save_user_profile_db(user_id, profile_data)
+    except Exception as e:
+        logger.error("保存导入画像失败: %s", e)
+        return error_response("导入成功但保存失败", 500)
+
+    sections = [k for k in profile_data.keys() if isinstance(k, str)]
+    return {
+        "success": True,
+        "message": "用户画像导入成功",
+        "imported_rows": imported_rows,
+        "sections": sections,
+        "meta": {
+            "updated_at": datetime.utcnow().isoformat()
+        }
+    }
+
+
 @api.route("/api/personalized-explanation", methods=["POST"])
 def get_personalized_explanation():
     """根据用户回答生成个性化解析"""
-    req = request.get_json()
+    req = get_json_body()
 
     question = req.get("question")
     user_answer = req.get("userAnswer")
@@ -290,11 +1825,11 @@ def get_personalized_explanation():
     if not question or not user_answer:
         return {"error": "Required Fields not provided"}, 400
 
-    print(f"=== 个性化解析请求 ===")
-    print(f"题目: {question[:100]}...")
-    print(f"用户答案: {user_answer[:100] if len(user_answer) > 100 else user_answer}")
-    print(f"正确答案: {correct_answer}")
-    print(f"题目类型: {question_type}")
+    logger.info("=== 个性化解析请求 ===")
+    logger.info("题目: %s...", question[:100])
+    logger.info("用户答案: %s", user_answer[:100] if len(user_answer) > 100 else user_answer)
+    logger.info("正确答案: %s", correct_answer)
+    logger.info("题目类型: %s", question_type)
 
     # 系统指令 - 简单直接版本
     system_instruction =  """你是专业的学科导师和教育评估专家，擅长根据学生的具体错误提供有针对性的学习指导。
@@ -387,7 +1922,7 @@ def get_personalized_explanation():
             max_tokens=2000
         )
         
-        print(f"原始响应: {response[:500]}...")
+        logger.info("原始响应: %s...", response[:500])
         
         # 尝试提取 JSON
         import json
@@ -396,7 +1931,7 @@ def get_personalized_explanation():
         # 尝试直接解析
         try:
             result = json.loads(response)
-            print("直接解析成功")
+            logger.info("直接解析成功")
             return result
         except json.JSONDecodeError:
             # 尝试提取 JSON 块
@@ -404,7 +1939,7 @@ def get_personalized_explanation():
             if json_match:
                 try:
                     result = json.loads(json_match.group(1))
-                    print("从代码块中解析成功")
+                    logger.info("从代码块中解析成功")
                     return result
                 except json.JSONDecodeError:
                     pass
@@ -414,13 +1949,13 @@ def get_personalized_explanation():
             if brace_match:
                 try:
                     result = json.loads(brace_match.group(0))
-                    print("从花括号中解析成功")
+                    logger.info("从花括号中解析成功")
                     return result
                 except json.JSONDecodeError:
                     pass
         
         # 如果所有解析都失败，返回结构化错误
-        print("无法解析 JSON，返回默认响应")
+        logger.warning("无法解析 JSON，返回默认响应")
         return {
             "analysis": f"很遗憾，你的回答与正确答案有所偏差。",
             "correction": f"正确答案是：{correct_answer}",
@@ -429,9 +1964,7 @@ def get_personalized_explanation():
         }
         
     except Exception as e:
-        print(f"个性化解析生成失败: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.exception("个性化解析生成失败: %s", e)
         return {
             "analysis": f"很遗憾，你的回答与正确答案有所偏差。",
             "correction": f"正确答案是：{correct_answer}",
@@ -442,7 +1975,7 @@ def get_personalized_explanation():
 @api.route("/api/quiz-followup", methods=["POST"])
 def quiz_followup():
     """处理用户对题目的追问，支持多轮对话"""
-    req = request.get_json()
+    req = get_json_body()
     
     question = req.get("question")
     correct_answer = req.get("correctAnswer")
@@ -457,10 +1990,10 @@ def quiz_followup():
     if not question or not user_question:
         return {"error": "缺少必要参数"}, 400
     
-    print(f"=== 题目追问请求 ===")
-    print(f"题目: {question[:100]}...")
-    print(f"用户追问: {user_question}")
-    print(f"对话历史: {len(conversation_history)} 轮")
+    logger.info("=== 题目追问请求 ===")
+    logger.info("题目: %s...", question[:100])
+    logger.info("用户追问: %s", user_question)
+    logger.info("对话历史: %s 轮", len(conversation_history))
     
     # 构建对话历史
     history_text = ""
@@ -504,24 +2037,18 @@ def quiz_followup():
             max_tokens=1500
         )
         
-        print(f"追问回答: {response[:200]}...")
+        logger.info("追问回答: %s...", response[:200])
         return {"answer": response}
         
     except Exception as e:
-        print(f"追问回答生成失败: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.exception("追问回答生成失败: %s", e)
         return {"error": "生成回答失败，请稍后重试"}, 500
-
-
-if __name__ == "__main__":
-    api.run(host="0.0.0.0", port=5000, debug=True)
 
 
 @api.route("/api/resource-qa", methods=["POST"])
 def resource_qa():
     """处理用户对学习资源的问题，支持多轮对话"""
-    req = request.get_json()
+    req = get_json_body()
     
     topic = req.get("topic")
     subtopic = req.get("subtopic")
@@ -532,10 +2059,10 @@ def resource_qa():
     if not user_question:
         return {"error": "问题不能为空"}, 400
     
-    print(f"=== 学习资源问答请求 ===")
-    print(f"主题: {topic} - {subtopic}")
-    print(f"用户问题: {user_question}")
-    print(f"对话历史: {len(conversation_history)} 轮")
+    logger.info("=== 学习资源问答请求 ===")
+    logger.info("主题: %s - %s", topic, subtopic)
+    logger.info("用户问题: %s", user_question)
+    logger.info("对话历史: %s 轮", len(conversation_history))
     
     history_text = ""
     for i, (q, a) in enumerate(conversation_history):
@@ -576,11 +2103,13 @@ def resource_qa():
             max_tokens=1500
         )
         
-        print(f"问答回答: {response[:200]}...")
+        logger.info("问答回答: %s...", response[:200])
         return {"answer": response}
         
     except Exception as e:
-        print(f"问答回答生成失败: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.exception("问答回答生成失败: %s", e)
         return {"error": "生成回答失败，请稍后重试"}, 500
+
+
+if __name__ == "__main__":
+    api.run(host="0.0.0.0", port=5000, debug=True)

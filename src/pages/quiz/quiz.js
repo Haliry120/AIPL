@@ -8,6 +8,10 @@ import Loader from "../../components/loader/loader";
 import { CircleCheck, CircleX } from "lucide-react";
 import userManager from '../../utils/userManager';
 
+const API_BASE = process.env.REACT_APP_API_URL || "http://localhost:5000";
+axios.defaults.baseURL = API_BASE;
+userManager.applyAuthHeader(axios);
+
 // 通用选项标准化，放在模块顶层以便 QuizPage 与 Question 共享
 const normalizeOptions = (q) => {
   if (!q) return [];
@@ -17,7 +21,7 @@ const normalizeOptions = (q) => {
   if (typeof opts === 'string') {
     const lines = opts.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
     if (lines.length > 1) {
-      return lines.map(l => l.replace(/^\s*([A-Za-z0-9\)\.\-]+)\s*/, '').trim());
+      return lines.map(l => l.replace(/^\s*([A-Za-z0-9).-]+)\s*/, '').trim());
     }
     const parts = opts.split(/[,;]\s*/).map(p => p.trim()).filter(p => p.length > 0);
     if (parts.length > 1) return parts;
@@ -123,7 +127,7 @@ const normalizeSavedUserAnswers = (uaRaw, questionList) => {
   }
   return out;
 };
-const Question = ({ questionData, num, style, userAnswers, setUserAnswers, course, topic }) => {
+const Question = ({ questionData, num, style, userAnswers, setUserAnswers, course, topic, inWrong, onToggleWrong }) => {
   // 统一规范题型，只允许七种
   const normalizeType = (t) => {
     const s = (t || '').toString().toLowerCase().trim();
@@ -142,7 +146,6 @@ const Question = ({ questionData, num, style, userAnswers, setUserAnswers, cours
   const isChoiceQuestion = ['single_choice', 'multiple_choice', 'true_false'].includes(normalizedType);
   // 是否为多选：由 correctAnswer 数组或明确的 multiple 标记决定
   const isMulti = normalizedType === 'multiple_choice' || Array.isArray(questionData.correctAnswer) || questionData.multiple === true;
-  const isOpenEnded = !isChoiceQuestion;
   const [personalizedExplanation, setPersonalizedExplanation] = useState(null);
   const [loadingExplanation, setLoadingExplanation] = useState(false);
   const [explanationError, setExplanationError] = useState(null);
@@ -151,6 +154,9 @@ const Question = ({ questionData, num, style, userAnswers, setUserAnswers, cours
   const [conversationHistory, setConversationHistory] = useState([]);
   const [loadingFollowUp, setLoadingFollowUp] = useState(false);
   const [isAsking, setIsAsking] = useState(false);
+  const [questionScore, setQuestionScore] = useState(null);
+  const [loadingScore, setLoadingScore] = useState(false);
+  const [scoreError, setScoreError] = useState(null);
 
   const handleAnswerChange = (e) => {
     setUserAnswers(prev => ({
@@ -204,7 +210,7 @@ const Question = ({ questionData, num, style, userAnswers, setUserAnswers, cours
     if (typeof opts === 'string') {
       const lines = opts.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
       if (lines.length > 1) {
-        return lines.map(l => l.replace(/^\s*([A-Za-z0-9\)\.\-]+)\s*/, '').trim());
+        return lines.map(l => l.replace(/^\s*([A-Za-z0-9).-]+)\s*/, '').trim());
       }
       const parts = opts.split(/[,;]\s*/).map(p => p.trim()).filter(p => p.length > 0);
       if (parts.length > 1) return parts;
@@ -219,7 +225,7 @@ const Question = ({ questionData, num, style, userAnswers, setUserAnswers, cours
     setLoadingExplanation(true);
     setExplanationError(null);
     try {
-      axios.defaults.baseURL = "http://localhost:5000";
+      axios.defaults.baseURL = API_BASE;
       const response = await axios.post("/api/personalized-explanation", {
         question: questionData.question,
         userAnswer: userAnswer,
@@ -228,11 +234,6 @@ const Question = ({ questionData, num, style, userAnswers, setUserAnswers, cours
         course: course,
         topic: topic,
         subtopic: questionData.subtopic
-      }, {
-        headers: {
-          "Access-Control-Allow-Origin": "*",
-          "X-User-ID": userManager.getUserId()
-        }
       });
       
       if (response.data.error) {
@@ -246,6 +247,37 @@ const Question = ({ questionData, num, style, userAnswers, setUserAnswers, cours
     } finally {
       explanationLock.current = false;
       setLoadingExplanation(false);
+    }
+  };
+
+  const fetchQuestionScore = async (userAnswer) => {
+    setLoadingScore(true);
+    setScoreError(null);
+    try {
+      axios.defaults.baseURL = API_BASE;
+      const response = await axios.post("/api/evaluate-question", {
+        question: questionData,
+        user_answer: userAnswer
+      });
+
+      if (response.data.success && response.data.evaluation) {
+        setQuestionScore(response.data.evaluation);
+        // 将分数保存到userAnswers中
+        setUserAnswers(prev => {
+          const current = prev[num - 1] || {};
+          return {
+            ...prev,
+            [num - 1]: { ...current, score: response.data.evaluation.score }
+          };
+        });
+      } else {
+        setScoreError("评分失败，请稍后重试");
+      }
+    } catch (error) {
+      console.error("获取题目分数失败:", error);
+      setScoreError("网络错误，请检查后端服务是否运行");
+    } finally {
+      setLoadingScore(false);
     }
   };
 
@@ -264,11 +296,11 @@ const Question = ({ questionData, num, style, userAnswers, setUserAnswers, cours
     const optsForQA = normalizeOptions(questionData);
     const correctAnswer = isChoiceQuestion && correctOption !== undefined
       ? (optsForQA[correctOption] ?? questionData.options?.[correctOption])
-      : (questionData.modelAnswer ?? questionData.correctAnswer ?? "参考答案为：" + correctAnswerRaw);
+      : (questionData.modelAnswer ?? questionData.correctAnswer ?? ("参考答案为：" + correctAnswerRaw));
 
     setLoadingFollowUp(true);
     try {
-      axios.defaults.baseURL = "http://localhost:5000";
+      axios.defaults.baseURL = API_BASE;
       const response = await axios.post("/api/quiz-followup", {
         question: questionData.question,
         userAnswer: userAnswer,
@@ -279,11 +311,6 @@ const Question = ({ questionData, num, style, userAnswers, setUserAnswers, cours
         subtopic: questionData.subtopic,
         conversationHistory: conversationHistory,
         userQuestion: followUpQuestion
-      }, {
-        headers: {
-          "Access-Control-Allow-Origin": "*",
-          "X-User-ID": userManager.getUserId()
-        }
       });
 
       if (response.data.error) {
@@ -331,9 +358,10 @@ const Question = ({ questionData, num, style, userAnswers, setUserAnswers, cours
     const optsForConfirm = normalizeOptions(questionData);
     const correctAnswer = isChoiceQuestion && correctOption !== undefined
       ? (optsForConfirm[correctOption] ?? questionData.options?.[correctOption])
-      : (questionData.modelAnswer ?? questionData.correctAnswer ?? "参考答案为：" + correctAnswerRaw);
+      : (questionData.modelAnswer ?? questionData.correctAnswer ?? ("参考答案为：" + correctAnswerRaw));
 
     fetchPersonalizedExplanation(userAnswer, correctAnswer);
+    fetchQuestionScore(userAnswer);
   };
 
   const uaEntry = userAnswers[num - 1] || userAnswers[String(num - 1)] || {};
@@ -356,7 +384,7 @@ const Question = ({ questionData, num, style, userAnswers, setUserAnswers, cours
       if (typeof val === 'string') {
         const s = val.trim();
         if (s.length === 0) return;
-        // 如果以字母开头（如 A 或 A. 文本）
+        // 如果以字母开头（如A 或 A. 文本）
         const m = s.match(/^[A-Za-z]/);
         if (m) {
           const letter = s[0].toUpperCase();
@@ -398,13 +426,20 @@ const Question = ({ questionData, num, style, userAnswers, setUserAnswers, cours
 
     return (
       <div className="question" style={style}>
-        <h3>
-          <span style={{ marginRight: "1ch" }}>{num + "."}</span>
-          <span style={{ marginRight: "0.8ch", color: '#9aa' }}>
-            {(questionData.multiple || correctIndices.length > 1) ? '多选' : '单选'}
-          </span>
-          {questionData.question}
-        </h3>
+        <div className="question-head">
+          <h3>
+            <span style={{ marginRight: "1ch" }}>{num + "."}</span>
+            <span style={{ marginRight: "0.8ch", color: '#9aa' }}>
+              {(questionData.multiple || correctIndices.length > 1) ? '多选' : '单选'}
+            </span>
+            {questionData.question}
+          </h3>
+          {onToggleWrong && (
+            <button className={`wrong-toggle ${inWrong ? 'active' : ''}`} onClick={onToggleWrong}>
+              {inWrong ? '已在错题集' : '加入错题'}
+            </button>
+          )}
+        </div>
         <div className="flexbox options">
           {optionsArray.map((option, index) => {
             const isSelected = selectedOptions.includes(index);
@@ -452,6 +487,51 @@ const Question = ({ questionData, num, style, userAnswers, setUserAnswers, cours
           )}
             {isSubmitted && (
             <div className="answer-result">
+              {loadingScore && (
+                <div className="loading-score">
+                  <span className="loading-spinner"></span>
+                  正在评分...
+                </div>
+              )}
+              {scoreError && (
+                <div className="score-error">
+                  <CircleX size={20} strokeWidth={2} color="#FF3D00" />
+                  <span>{scoreError}</span>
+                </div>
+              )}
+              {questionScore && !loadingScore && (
+                <div className="question-score">
+                  <div className={`score-badge ${questionScore.score === 10 ? 'perfect' : questionScore.score >= 7 ? 'good' : 'needs-improvement'}`}>
+                    <span className="score-number">{questionScore.score}</span>
+                    <span className="score-label">分</span>
+                  </div>
+                  {questionScore.feedback && (
+                    <div className="score-feedback">
+                      <strong>评价：</strong>{questionScore.feedback}
+                    </div>
+                  )}
+                  {questionScore.strengths && questionScore.strengths.length > 0 && (
+                    <div className="score-strengths">
+                      <strong>优点：</strong>
+                      <ul>
+                        {questionScore.strengths.map((strength, idx) => (
+                          <li key={idx}>{strength}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {questionScore.improvements && questionScore.improvements.length > 0 && (
+                    <div className="score-improvements">
+                      <strong>改进建议：</strong>
+                      <ul>
+                        {questionScore.improvements.map((improvement, idx) => (
+                          <li key={idx}>{improvement}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+              )}
               {correctIndices && correctIndices.length > 0 ? (
                 <div className="correct-answer">
                   <CircleCheck size={24} strokeWidth={2} color="#00FFE0" />
@@ -490,7 +570,7 @@ const Question = ({ questionData, num, style, userAnswers, setUserAnswers, cours
                   </div>
                   {personalizedExplanation.correction && (
                     <div className="explanation-section correction">
-                      <strong>✅ 纠正：</strong>
+                      <strong>纠正：</strong>
                       {personalizedExplanation.correction}
                     </div>
                   )}
@@ -581,25 +661,32 @@ const Question = ({ questionData, num, style, userAnswers, setUserAnswers, cours
 
   return (
     <div className="question" style={style}>
-      <h3>
-        <span style={{ marginRight: "1ch" }}>{num + "."}</span>
-        <span style={{ marginRight: "0.8ch", color: '#9aa' }}>
-          {(() => {
-            switch (normalizedType) {
-              case 'single_choice': return '单选';
-              case 'multiple_choice': return '多选';
-              case 'short_answer': return '简答';
-              case 'calculation': return '计算';
-              case 'case_study': return '案例分析';
-              case 'true_false': return '判断';
-              case 'fill_in_the_blank': return '填空';
-              default:
-                return '';
-            }
-          })()}
-        </span>
-        {questionData.question}
-      </h3>
+      <div className="question-head">
+        <h3>
+          <span style={{ marginRight: "1ch" }}>{num + "."}</span>
+          <span style={{ marginRight: "0.8ch", color: '#9aa' }}>
+            {(() => {
+              switch (normalizedType) {
+                case 'single_choice': return '单选';
+                case 'multiple_choice': return '多选';
+                case 'short_answer': return '简答';
+                case 'calculation': return '计算';
+                case 'case_study': return '案例分析';
+                case 'true_false': return '判断';
+                case 'fill_in_the_blank': return '填空';
+                default:
+                  return '';
+              }
+            })()}
+          </span>
+          {questionData.question}
+        </h3>
+        {onToggleWrong && (
+          <button className={`wrong-toggle ${inWrong ? 'active' : ''}`} onClick={onToggleWrong}>
+            {inWrong ? '已在错题集' : '加入错题'}
+          </button>
+        )}
+      </div>
       <div className="options">
         <textarea
           className="answer-input"
@@ -615,14 +702,59 @@ const Question = ({ questionData, num, style, userAnswers, setUserAnswers, cours
         )}
         {isSubmitted && (
           <div className="result-section">
-            {questionData.modelAnswer && (
+            {loadingScore && (
+              <div className="loading-score">
+                <span className="loading-spinner"></span>
+                正在评分...
+              </div>
+            )}
+            {scoreError && (
+              <div className="score-error">
+                <CircleX size={20} strokeWidth={2} color="#FF3D00" />
+                <span>{scoreError}</span>
+              </div>
+            )}
+            {questionScore && !loadingScore && (
+              <div className="question-score">
+                <div className={`score-badge ${questionScore.score === 10 ? 'perfect' : questionScore.score >= 7 ? 'good' : 'needs-improvement'}`}>
+                  <span className="score-number">{questionScore.score}</span>
+                  <span className="score-label">分</span>
+                </div>
+                {questionScore.feedback && (
+                  <div className="score-feedback">
+                    <strong>评价：</strong>{questionScore.feedback}
+                  </div>
+                )}
+                {questionScore.strengths && questionScore.strengths.length > 0 && (
+                  <div className="score-strengths">
+                    <strong>优点：</strong>
+                    <ul>
+                      {questionScore.strengths.map((strength, idx) => (
+                        <li key={idx}>{strength}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                {questionScore.improvements && questionScore.improvements.length > 0 && (
+                  <div className="score-improvements">
+                    <strong>改进建议：</strong>
+                    <ul>
+                      {questionScore.improvements.map((improvement, idx) => (
+                        <li key={idx}>{improvement}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </div>
+            )}
+            {(questionData.modelAnswer || questionData.correctAnswer || questionData.answer || questionData.answerText) && (
               <div className="model-answer">
                 <div className="model-answer-header">
                   <CircleCheck size={24} strokeWidth={2} color="#00FFE0" />
-                  <strong>参考答案</strong>
+                  <strong>参考答案：</strong>
                 </div>
                 <div className="model-answer-content">
-                  {questionData.modelAnswer}
+                  {questionData.modelAnswer || questionData.correctAnswer || questionData.answer || questionData.answerText}
                 </div>
               </div>
             )}
@@ -670,7 +802,7 @@ const Question = ({ questionData, num, style, userAnswers, setUserAnswers, cours
                 </div>
                 {personalizedExplanation.correction && (
                   <div className="explanation-section correction">
-                    <strong>✅ 纠正：</strong>
+                    <strong>纠正：</strong>
                     {personalizedExplanation.correction}
                   </div>
                 )}
@@ -755,7 +887,9 @@ const QuizPage = (props) => {
   const [topic, setTopic] = useState("");
   const [questions, setQuestions] = useState([]);
   const [userAnswers, setUserAnswers] = useState({});
+  const [wrongFlags, setWrongFlags] = useState({});
   const [loading, setLoading] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
   const [viewMode, setViewMode] = useState(false);
   const [startTime] = useState(() => new Date().getTime());
   const [numQues, setNumQues] = useState(0);
@@ -785,7 +919,7 @@ const QuizPage = (props) => {
     setDescription(
       roadmaps[course][week].subtopics[subtopicNum - 1].description
     );
-  }, [course, weekNum, subtopicNum]);
+  }, [course, weekNum, subtopicNum, navigate]);
 
   useEffect(() => {
     const load = async () => {
@@ -804,8 +938,6 @@ const QuizPage = (props) => {
             course,
             week: weekNum,
             subtopic: subtopicNum
-          }, {
-            headers: { 'X-User-ID': userManager.getUserId() }
           });
           console.log('[quiz] pre-clean delete-quiz-records done', delRes && delRes.data);
         } catch (err) {
@@ -849,8 +981,7 @@ const QuizPage = (props) => {
           axios.defaults.baseURL = 'http://localhost:5000';
           console.log('[quiz] view-mode: requesting /api/quiz-records', { course, week: weekNum, subtopic: subtopicNum });
           const res = await axios.get('/api/quiz-records', {
-            params: { course, week: weekNum, subtopic: subtopicNum },
-            headers: { 'X-User-ID': userManager.getUserId() }
+            params: { course, week: weekNum, subtopic: subtopicNum }
           });
           console.log('[quiz] view-mode: /api/quiz-records response', res && res.data ? res.data : res);
           if (res.data && res.data.success && res.data.records && res.data.records.length > 0) {
@@ -889,13 +1020,8 @@ const QuizPage = (props) => {
 
       try {
         console.log("fetching questions...");
-        axios.defaults.baseURL = "http://localhost:5000";
-        const res = await axios.post('/api/quiz', { course, topic, subtopic, description }, {
-          headers: {
-            "Access-Control-Allow-Origin": "*",
-            "X-User-ID": userManager.getUserId(),
-          }
-        });
+        axios.defaults.baseURL = API_BASE;
+        const res = await axios.post('/api/quiz', { course, topic, subtopic, description });
         setQuestions(res.data.questions);
         setNumQues(res.data.questions.length);
         quizzes[course] = quizzes[course] || {};
@@ -905,7 +1031,7 @@ const QuizPage = (props) => {
 
         // 生成题目后保存初始记录（题目/正确答案/解析，用户答案为空）
         try {
-          axios.defaults.baseURL = 'http://localhost:5000';
+          axios.defaults.baseURL = API_BASE;
           const initialRecord = {
             numQues: res.data.questions.length,
             numCorrect: 0,
@@ -922,11 +1048,6 @@ const QuizPage = (props) => {
             week: weekNum,
             subtopic: subtopicNum,
             record: initialRecord
-          }, {
-            headers: {
-              'Access-Control-Allow-Origin': '*',
-              'X-User-ID': userManager.getUserId(),
-            }
           });
           console.log('[quiz] save initial record done', saveInitRes && saveInitRes.data);
         } catch (err) {
@@ -966,6 +1087,93 @@ const QuizPage = (props) => {
     }
   }, [userAnswers, questions, course, weekNum, subtopicNum]);
 
+  // 查询当前题目哪些已在错题集
+  useEffect(() => {
+    if (!course || !weekNum || !subtopicNum) return;
+    if (!questions || questions.length === 0) return;
+    const run = async () => {
+      try {
+        axios.defaults.baseURL = 'http://localhost:5000';
+        const res = await axios.post('/api/wrong-questions/check', {
+          course,
+          week: weekNum,
+          subtopic: subtopicNum,
+          questions,
+        });
+        if (res.data && res.data.success) {
+          const map = {};
+          (res.data.indices || []).forEach(i => { map[i] = true; });
+          setWrongFlags(map);
+        }
+      } catch (e) {
+        console.warn('查询错题 membership 失败', e);
+      } finally {
+      }
+    };
+    run();
+  }, [course, weekNum, subtopicNum, questions]);
+
+  const formatCorrectToken = (token, opts) => {
+    if (token === undefined || token === null) return '';
+    if (typeof token === 'number' && opts && opts[token]) return opts[token];
+    if (typeof token === 'string') {
+      const trimmed = token.trim();
+      if (/^[A-Za-z]$/.test(trimmed)) {
+        const idx = trimmed.toUpperCase().charCodeAt(0) - 65;
+        if (opts && opts[idx]) return opts[idx];
+      }
+      return trimmed;
+    }
+    return String(token);
+  };
+
+  const computeCorrectText = (q) => {
+    const opts = normalizeOptions(q);
+    const raw = q.correctAnswer ?? q.answerIndex ?? q.answer;
+    if (Array.isArray(raw)) {
+      const parts = raw.map(r => formatCorrectToken(r, opts)).filter(Boolean);
+      if (parts.length) return parts.join(', ');
+    }
+    const single = formatCorrectToken(raw, opts) || q.modelAnswer || q.correctAnswer || '';
+    return single;
+  };
+
+  const computeUserAnswerText = (idx) => {
+    const q = questions[idx];
+    if (!q) return '';
+    const ua = userAnswers[idx] || userAnswers[String(idx)] || {};
+    const opts = normalizeOptions(q);
+    if (ua.selectedOptions && ua.selectedOptions.length > 0) {
+      return ua.selectedOptions.map(i => opts[i] || String.fromCharCode(65 + (i || 0))).join(', ');
+    }
+    if (ua.text) return ua.text;
+    return '';
+  };
+
+  const handleToggleWrong = async (index) => {
+    const q = questions[index];
+    if (!q) return;
+    try {
+      axios.defaults.baseURL = 'http://localhost:5000';
+      const payload = {
+        course,
+        week: weekNum,
+        subtopic: subtopicNum,
+        question: q,
+        user_answer: computeUserAnswerText(index),
+        correct_answer: computeCorrectText(q),
+        difficulty: q.difficulty,
+      };
+      const res = await axios.post('/api/wrong-questions/toggle', payload);
+      if (res.data && res.data.success) {
+        setWrongFlags(prev => ({ ...prev, [index]: res.data.inWrong }));
+      }
+    } catch (e) {
+      console.warn('切换错题状态失败', e);
+      alert('操作失败，请稍后重试');
+    }
+  };
+
   const SubmitButton = () => {
     // 加载中或暂无题目时不渲染提交按钮，避免空白页只剩按钮
     if (loading || !questions || questions.length === 0) return null;
@@ -975,18 +1183,28 @@ const QuizPage = (props) => {
         {!viewMode && (
           <button
             className="SubmitButton"
+            disabled={submitting}
             onClick={async () => {
-              setLoading(true);
+              setSubmitting(true);
               const timeTaken = new Date().getTime() - startTime;
 
-              // 计算分数（仅对选择题进行评分，简易逻辑）
-              let numCorrect = 0;
-              let scorable = 0;
+              // 计算总分（每题0分，使用百分制）
+              let totalScore = 0;
+              let totalPossibleScore = 0;
+              
               for (let i = 0; i < questions.length; i++) {
                 const q = questions[i];
                 const ua = userAnswers[i] || {};
-                if (q.options && q.options.length > 0) {
-                  scorable += 1;
+                const qType = q.type ? q.type.toLowerCase() : '';
+                
+                // 每题满分10分
+                totalPossibleScore += 10;
+                
+                // 选择题类型：single_choice, multiple_choice, true_false
+                const isChoiceQuestion = ['single_choice', 'multiple_choice', 'true_false'].includes(qType);
+                
+                if (isChoiceQuestion && q.options && q.options.length > 0) {
+                  // 选择题：全部选对得10分，否则0分
                   const parseCorrect = (raw, opts) => {
                     const indices = [];
                     if (raw === undefined || raw === null) return indices;
@@ -1025,18 +1243,24 @@ const QuizPage = (props) => {
                     const selSet = new Set(selected || []);
                     const corrSet = new Set(correctIndices);
                     if (selSet.size === corrSet.size && [...selSet].every(x => corrSet.has(x))) {
-                      numCorrect += 1;
+                      totalScore += 10;
                     }
+                  }
+                } else {
+                  // 非选择题：使用AI评估的分数（如果有）
+                  if (ua.score !== undefined && ua.score !== null) {
+                    totalScore += ua.score;
                   }
                 }
               }
 
-              const scorePercent = scorable > 0 ? Math.round((numCorrect / scorable) * 10000) / 100 : null;
+              // 计算百分制分数
+              const scorePercent = totalPossibleScore > 0 ? Math.round((totalScore / totalPossibleScore) * 10000) / 100 : 0;
 
               const record = {
                 numQues: numQues,
-                numCorrect: numCorrect,
-                scorable: scorable,
+                totalScore: totalScore,
+                totalPossibleScore: totalPossibleScore,
                 scorePercent: scorePercent,
                 timeTaken: timeTaken,
                 userAnswers: userAnswers,
@@ -1044,36 +1268,33 @@ const QuizPage = (props) => {
                 completedAt: new Date().toISOString(),
               };
 
-              // 先删除旧的测验记录
               try {
-                axios.defaults.baseURL = 'http://localhost:5000';
-                await axios.post('/api/delete-quiz-records', {
-                  course,
-                  week: weekNum,
-                  subtopic: subtopicNum
-                }, {
-                  headers: { 'X-User-ID': userManager.getUserId() }
-                });
-              } catch (e) {
-                console.warn('后端测验记录删除失败', e);
-              }
+                // 先删除旧的测验记录
+                try {
+                  axios.defaults.baseURL = 'http://localhost:5000';
+                  await axios.post('/api/delete-quiz-records', {
+                    course,
+                    week: weekNum,
+                    subtopic: subtopicNum
+                  });
+                } catch (e) {
+                  console.warn('后端测验记录删除失败', e);
+                }
 
-              // 再保存新测验记录
-              try {
-                axios.defaults.baseURL = 'http://localhost:5000';
-                await axios.post('/api/save-quiz-record', {
-                  course,
-                  week: weekNum,
-                  subtopic: subtopicNum,
-                  record,
-                }, {
-                  headers: {
-                    'Access-Control-Allow-Origin': '*',
-                    'X-User-ID': userManager.getUserId(),
-                  }
-                });
-              } catch (err) {
-                console.warn('保存测验记录到后端失败，继续本地保存', err);
+                // 再保存新测验记录（评分在后台完成）
+                try {
+                  axios.defaults.baseURL = API_BASE;
+                  await axios.post('/api/save-quiz-record', {
+                    course,
+                    week: weekNum,
+                    subtopic: subtopicNum,
+                    record,
+                  });
+                } catch (err) {
+                  console.warn('保存测验记录到后端失败，继续本地保存', err);
+                }
+              } finally {
+                setSubmitting(false);
               }
 
               // 本地保存用于查看（即时响应）
@@ -1104,11 +1325,10 @@ const QuizPage = (props) => {
                 console.warn('更新 quizStats 失败', e);
               }
 
-              setLoading(false);
               navigate(ROUTES.ROADMAP + '?topic=' + encodeURI(course));
             }}
           >
-            提交
+            {submitting ? '提交中...' : '提交'}
           </button>
         )}
       </div>
@@ -1137,7 +1357,7 @@ const QuizPage = (props) => {
         {viewMode && !loading && questions.length === 0 && (
           <div style={{ border: '1px dashed #ccc', padding: '1rem', marginBottom: '1rem' }}>
             <strong>未找到测验记录</strong>
-            <div style={{ marginTop: '0.5rem' }}>数据库记录可能已删除或本地缓存不存在。您可以：</div>
+            <div style={{ marginTop: '0.5rem' }}>数据库记录可能已删除或本地缓存不存在。您可以重新答题或返回学习路径。</div>
             <div style={{ display: 'flex', gap: '0.6rem', marginTop: '0.8rem' }}>
               <button className="ask-button" onClick={() => {
                 // 跳转到非查看模式重新答题
@@ -1163,6 +1383,8 @@ const QuizPage = (props) => {
               setUserAnswers={setUserAnswers}
               course={course}
               topic={topic}
+              inWrong={!!wrongFlags[index]}
+              onToggleWrong={() => handleToggleWrong(index)}
             />
           );
         })}
@@ -1191,8 +1413,6 @@ const QuizPage = (props) => {
                     course,
                     week: weekNum,
                     subtopic: subtopicNum
-                  }, {
-                    headers: { 'X-User-ID': userManager.getUserId() }
                   });
                 } catch (e) {
                   console.warn('后端测验记录删除失败', e);
@@ -1204,13 +1424,8 @@ const QuizPage = (props) => {
                 setViewMode(false);
                 setTimeout(async () => {
                   try {
-                    axios.defaults.baseURL = "http://localhost:5000";
-                    const res = await axios.post('/api/quiz', { course, topic, subtopic, description }, {
-                      headers: {
-                        "Access-Control-Allow-Origin": "*",
-                        "X-User-ID": userManager.getUserId(),
-                      }
-                    });
+                    axios.defaults.baseURL = API_BASE;
+                    const res = await axios.post('/api/quiz', { course, topic, subtopic, description });
                     setQuestions(res.data.questions);
                     setNumQues(res.data.questions.length);
                     // 更新 quizzes 本地缓存
@@ -1222,7 +1437,7 @@ const QuizPage = (props) => {
 
                     // 生成新题后立即保存初始测验记录到数据库
                     try {
-                      axios.defaults.baseURL = 'http://localhost:5000';
+                      axios.defaults.baseURL = API_BASE;
                       const initialRecord = {
                         numQues: res.data.questions.length,
                         numCorrect: 0,
@@ -1238,11 +1453,6 @@ const QuizPage = (props) => {
                         week: weekNum,
                         subtopic: subtopicNum,
                         record: initialRecord
-                      }, {
-                        headers: {
-                          'Access-Control-Allow-Origin': '*',
-                          'X-User-ID': userManager.getUserId(),
-                        }
                       });
                     } catch (err) {
                       console.warn('生成新题后保存初始测验记录到后端失败', err);

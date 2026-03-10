@@ -11,6 +11,21 @@
   border-radius: 50%;
   border: 2px solid white;
 }
+
+.profile_link_avatar {
+  display: inline-block;
+  border-radius: 50%;
+  line-height: 0;
+}
+
+.profile_link_name {
+  text-decoration: none;
+  color: inherit;
+}
+
+.profile_link_name h1 {
+  color: inherit;
+}
 .profile_wrapper .info .text {
   flex-direction: column;
   align-items: flex-start;

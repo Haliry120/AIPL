@@ -3,7 +3,9 @@ import siliconflow_client
     
 def generate_resources(course, knowledge_level, description, time):
     """使用硅基流动API生成学习资源"""
-    
+    if not course or str(course).strip() == "":
+        raise ValueError("course为必填字段，不能为空")
+
     # 系统指令
     system_instruction = '''你是一位专业的教育专家和AI学习助手。请直接生成完整、详细、可直接学习的内容资料，而不是学习计划或路径。
 
@@ -68,9 +70,9 @@ def generate_resources(course, knowledge_level, description, time):
     # 使用客户端生成文本响应
     client = siliconflow_client.get_client()
     return client.generate_text(
-        system_instruction=system_instruction,
-        user_prompt=user_prompt,
-        temperature=1,
-        top_p=0.95,
-        max_tokens=8192
+      system_instruction=system_instruction,
+      user_prompt=user_prompt,
+      temperature=1,
+      top_p=0.95,
+      max_tokens=8192
     )
