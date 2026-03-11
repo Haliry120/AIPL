@@ -10,6 +10,7 @@ import io
 from datetime import datetime, timedelta
 import os
 import time
+import random
 import jwt
 import uuid
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -776,6 +777,7 @@ def get_roadmap():
         topic=topic,
         time=req.get("time", "4 weeks"),
         knowledge_level=req.get("knowledge_level", "Absolute Beginner"),
+        user_id=user_id,
     )
 
     # 保存到数据库
@@ -816,7 +818,7 @@ def get_quiz():
         return error_response("Required Fields not provided", 400)
 
     # 生成测验
-    response_body = quiz.get_quiz(course, topic, subtopic, description, user_profile=user_profile)
+    response_body = quiz.get_quiz(course, topic, subtopic, description, user_profile=user_profile, user_id=user_id)
     return response_body
 
 @api.route("/api/quiz-score", methods=["POST"])
@@ -856,7 +858,7 @@ def evaluate_question():
         subtopic = question.get("subtopic", "未知子主题")
         question_type = question.get("type", "short_answer")
         
-        result = quiz.evaluate_question_score(course, topic, subtopic, question, user_answer, question_type)
+        result = quiz.evaluate_question_score(course, topic, subtopic, question, user_answer, question_type, user_id=user_id)
         return {"success": True, "evaluation": result}
     except Exception as e:
         logger.error('评估题目失败: %s', e)
@@ -890,7 +892,8 @@ def _async_finalize_quiz(record_id, user_id, course, week, subtopic, record):
                     subtopic=subtopic,
                     question=q,
                     user_answer=selected if question_type in ['single_choice', 'multiple_choice', 'true_false'] else user_answer_text,
-                    question_type=question_type
+                    question_type=question_type,
+                    user_id=user_id,
                 )
 
                 question_scores[qid] = {
@@ -1173,6 +1176,7 @@ def generative_resource():
         "knowledge_level": req.get("knowledge_level"),
         "description": req.get("description"),
         "time": req.get("time"),
+        "user_id": user_id,
     }
 
     for key, value in req_data.items():
@@ -1197,35 +1201,123 @@ def search_bilibili():
 
     subtopic = req.get("subtopic", "")
     course = req.get("course", "")
+    extra_keyword = (req.get("extra_keyword") or "").strip()
+    extra_keyword_cn = extra_keyword
+    refresh = _parse_bool(req.get("refresh"), False)
+    raw_page = req.get("page")
+    try:
+        page = int(raw_page)
+    except (TypeError, ValueError):
+        page = 1
+    if page < 1 or page > 10:
+        page = 1
+    if refresh and page == 1:
+        page = random.randint(2, 6)
 
     # 将英文关键词翻译成中文
     try:
-        subtopic_cn = translate.translate_text_arr([subtopic], target="zh-CN")[0] if subtopic else ""
-        course_cn = translate.translate_text_arr([course], target="zh-CN")[0] if course else ""
+        subtopic_cn = translate.translate_text_arr([subtopic], target="zh-CN", user_id=get_user_id_optional())[0] if subtopic else ""
+        course_cn = translate.translate_text_arr([course], target="zh-CN", user_id=get_user_id_optional())[0] if course else ""
+        if extra_keyword:
+            extra_keyword_cn = translate.translate_text_arr([extra_keyword], target="zh-CN", user_id=get_user_id_optional())[0]
         logger.info("Translated: %s -> %s, %s -> %s", subtopic, subtopic_cn, course, course_cn)
     except Exception as e:
         logger.warning("Translation error: %s, using original keywords", e)
         subtopic_cn = subtopic
         course_cn = course
+        extra_keyword_cn = extra_keyword
 
-        # 使用翻译后的中文关键词搜索
-    keyword = f"{subtopic_cn} 教程"
+    def _keyword_terms(text):
+        raw = (text or "").strip().lower()
+        if not raw:
+            return []
+        # Keep both full phrase and split terms to improve matching robustness.
+        parts = [seg for seg in re.split(r"[\s,，;；/|]+", raw) if seg]
+        terms = [raw]
+        for seg in parts:
+            if seg not in terms:
+                terms.append(seg)
+        return terms
 
-    logger.info("Searching Bilibili for: %s", keyword)
-    courses = bilibili_search.search_bilibili_courses(keyword)
+    def _filter_courses_by_terms(courses_list, terms):
+        if not terms:
+            return courses_list
 
-    # 如果第一次搜索无结果,尝试其他组合
-    if not courses:
-        logger.info("No results for '%s', trying with course name", keyword)
-        keyword = f"{course_cn} {subtopic_cn}"
-        courses = bilibili_search.search_bilibili_courses(keyword)
+        scored = []
+        for item in courses_list or []:
+            title = str(item.get("title") or "").lower()
+            desc = str(item.get("description") or "").lower()
+            text = f"{title} {desc}"
+            score = sum(1 for term in terms if term and term in text)
+            if score > 0:
+                scored.append((score, item))
 
-    if not courses:
-        logger.info("No results for '%s', trying with course only", keyword)
-        keyword = f"{course_cn}"
-        courses = bilibili_search.search_bilibili_courses(keyword)
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        return [item for _, item in scored]
 
-    return {"courses": courses, "keyword": keyword}
+    keyword_terms = _keyword_terms(extra_keyword_cn)
+
+    keyword_candidates = []
+    if extra_keyword_cn:
+        keyword_candidates.extend(
+            [
+                f"{subtopic_cn} {extra_keyword_cn} 教程".strip(),
+                f"{course_cn} {subtopic_cn} {extra_keyword_cn}".strip(),
+                f"{course_cn} {extra_keyword_cn}".strip(),
+                f"{extra_keyword_cn} 教程".strip(),
+            ]
+        )
+    else:
+        keyword_candidates.extend(
+            [
+                f"{subtopic_cn} 教程".strip(),
+                f"{course_cn} {subtopic_cn}".strip(),
+                f"{course_cn}".strip(),
+            ]
+        )
+
+    # 去重并去空
+    deduped_keywords = []
+    for kw in keyword_candidates:
+        safe_kw = " ".join((kw or "").split())
+        if safe_kw and safe_kw not in deduped_keywords:
+            deduped_keywords.append(safe_kw)
+
+    courses = []
+    keyword = deduped_keywords[0] if deduped_keywords else ""
+    for kw in deduped_keywords:
+        logger.info("Searching Bilibili for: %s (page=%s, refresh=%s)", kw, page, refresh)
+        keyword = kw
+        # When keyword is provided, try nearby pages and keep keyword-matching results first.
+        trial_pages = [page]
+        if keyword_terms:
+            trial_pages.extend([p for p in [page + 1, page + 2] if 1 <= p <= 10])
+
+        for trial_page in trial_pages:
+            raw_courses = bilibili_search.search_bilibili_courses(kw, page=trial_page)
+            filtered_courses = _filter_courses_by_terms(raw_courses, keyword_terms)
+
+            # Prefer strict keyword-matched list; fallback to raw list only when no keyword terms.
+            if filtered_courses:
+                courses = filtered_courses[:10]
+                page = trial_page
+                break
+            if raw_courses and not keyword_terms:
+                courses = raw_courses[:10]
+                page = trial_page
+                break
+
+        if courses:
+            break
+
+    return {
+        "courses": courses,
+        "keyword": keyword,
+        "extra_keyword": extra_keyword,
+        "extra_keyword_cn": extra_keyword_cn,
+        "page": page,
+        "refresh": refresh,
+    }
 
 
 # -------------------- 错题集与重做 --------------------
@@ -1919,7 +2011,9 @@ def get_personalized_explanation():
             user_prompt=user_prompt,
             temperature=0.7,
             top_p=0.9,
-            max_tokens=2000
+            max_tokens=2000,
+            user_id=get_user_id_optional(),
+            scenario="explanation",
         )
         
         logger.info("原始响应: %s...", response[:500])
@@ -2034,7 +2128,9 @@ def quiz_followup():
             user_prompt=user_prompt,
             temperature=0.7,
             top_p=0.9,
-            max_tokens=1500
+            max_tokens=1500,
+            user_id=get_user_id_optional(),
+            scenario="quiz_followup",
         )
         
         logger.info("追问回答: %s...", response[:200])
@@ -2100,7 +2196,9 @@ def resource_qa():
             user_prompt=user_prompt,
             temperature=0.7,
             top_p=0.9,
-            max_tokens=1500
+            max_tokens=1500,
+            user_id=get_user_id_optional(),
+            scenario="resource_qa",
         )
         
         logger.info("问答回答: %s...", response[:200])

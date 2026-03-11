@@ -2,7 +2,7 @@ import json
 import siliconflow_client
     
 
-def evaluate_question_score(course, topic, subtopic, question, user_answer, question_type):
+def evaluate_question_score(course, topic, subtopic, question, user_answer, question_type, user_id=None):
     """评估单个题目的分数
     
     Args:
@@ -149,7 +149,9 @@ def evaluate_question_score(course, topic, subtopic, question, user_answer, ques
                 user_prompt=user_prompt,
                 temperature=0.7,
                 top_p=0.9,
-                max_tokens=2000
+                max_tokens=2000,
+                user_id=user_id,
+                scenario="evaluation",
             )
             
             # 确保分数在0-10范围内
@@ -232,7 +234,7 @@ def _summarize_user_profile(profile_data):
     return json.dumps(summary, ensure_ascii=False)
 
 
-def get_quiz(course, topic, subtopic, description, user_profile=None):
+def get_quiz(course, topic, subtopic, description, user_profile=None, user_id=None):
     """使用硅基流动API生成测验题目"""
         
     system_instruction =  """你是一位专业的教育评估专家和测验设计AI助手。请根据提供的学习内容生成高质量、多样化的测验题目。
@@ -355,5 +357,7 @@ def get_quiz(course, topic, subtopic, description, user_profile=None):
         user_prompt=user_prompt,
         temperature=1,
         top_p=0.95,
-        max_tokens=20000
+        max_tokens=20000,
+        user_id=user_id,
+        scenario="quiz",
     )

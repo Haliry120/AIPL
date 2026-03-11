@@ -9,6 +9,7 @@ import time
 import random
 import requests
 from dotenv import load_dotenv
+import prompt_injector
 
 load_dotenv()
 
@@ -92,10 +93,15 @@ class SiliconFlowClient:
 
         raise RuntimeError("Failed to complete request after all retries")
 
-    def generate_json(self, system_instruction, user_prompt, temperature=1, top_p=0.95, max_tokens=8192):
+    def generate_json(self, system_instruction, user_prompt, temperature=1, top_p=0.95, max_tokens=8192, user_id=None, scenario=None):
         """生成 JSON 格式响应"""
+        merged_system_instruction = prompt_injector.merge_system_instruction(
+            system_instruction,
+            user_id=user_id,
+            scenario=scenario,
+        )
         messages = [
-            {"role": "system", "content": system_instruction},
+            {"role": "system", "content": merged_system_instruction},
             {"role": "user", "content": user_prompt}
         ]
 
@@ -112,10 +118,15 @@ class SiliconFlowClient:
         print(content)
         return json.loads(content)
 
-    def generate_text(self, system_instruction, user_prompt, temperature=1, top_p=0.95, max_tokens=8192):
+    def generate_text(self, system_instruction, user_prompt, temperature=1, top_p=0.95, max_tokens=8192, user_id=None, scenario=None):
         """生成纯文本响应"""
+        merged_system_instruction = prompt_injector.merge_system_instruction(
+            system_instruction,
+            user_id=user_id,
+            scenario=scenario,
+        )
         messages = [
-            {"role": "system", "content": system_instruction},
+            {"role": "system", "content": merged_system_instruction},
             {"role": "user", "content": user_prompt}
         ]
 

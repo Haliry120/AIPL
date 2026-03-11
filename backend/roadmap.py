@@ -1,7 +1,7 @@
 import siliconflow_client
   
   
-def create_roadmap(topic, time, knowledge_level):
+def create_roadmap(topic, time, knowledge_level, user_id=None):
     """使用硅基流动API生成学习路线图"""
     
     # 系统指令
@@ -35,5 +35,7 @@ def create_roadmap(topic, time, knowledge_level):
         user_prompt=user_prompt,
         temperature=1,
         top_p=0.95,
-        max_tokens=8192
+      max_tokens=8192,
+      user_id=user_id,
+      scenario="roadmap",
     )

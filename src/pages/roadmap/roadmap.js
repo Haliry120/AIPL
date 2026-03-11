@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import axios from "axios";
 import "./roadmap.css";
@@ -28,6 +28,9 @@ const RoadmapPage = (props) => {
   const [roadmap, setRoadmap] = useState({});
   const [regenerating, setRegenerating] = useState(false);
   const [regenerateResource, setRegenerateResource] = useState(false);
+  const [resourceMode, setResourceMode] = useState("ai");
+  const [videoKeywordInput, setVideoKeywordInput] = useState("");
+  const [videoSearchPage, setVideoSearchPage] = useState(1);
   const [canceling, setCanceling] = useState(false);
   const [topicDetails, setTopicDetails] = useState({
     time: "-",
@@ -37,6 +40,7 @@ const RoadmapPage = (props) => {
   const [confettiExplode, setConfettiExplode] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [confirmOptions, setConfirmOptions] = useState({});
+  const videoResultCacheRef = useRef({});
   const navigate = useNavigate();
   const topic = searchParams.get("topic");
   if (!topic) {
@@ -99,31 +103,13 @@ const RoadmapPage = (props) => {
             {subtopic.subtopic}
           </h3>
           <p className="time">
-            {(
-              parseFloat(subtopic.time.replace(/^\D+/g, "")) *
-              (parseFloat(localStorage.getItem("hardnessIndex")) || 1)
-            ).toFixed(1)}{' '}
+            {parseFloat(subtopic.time.replace(/^\D+/g, "")).toFixed(1)}{' '}
             {subtopic.time.replace(/[0-9]/g, "")}
           </p>
           <p style={{ fontWeight: "300", opacity: "61%", marginTop: "1em" }}>
             {subtopic.description}
           </p>
         </div>
-        <div
-          className="hardness"
-          onClick={() => {
-            let hardness = prompt("请评价难度 (1-10)");
-            if (hardness) {
-              let hardnessIndex = parseFloat(localStorage.getItem("hardnessIndex")) || 1;
-              hardnessIndex = hardnessIndex + (hardness - 5) / 10;
-              localStorage.setItem("hardnessIndex", hardnessIndex);
-              window.location.reload();
-            }
-          }}
-        >
-          评价难度
-        </div>
-
         <div className="flexbox buttons" style={{ flexDirection: "column" }}>
           <button
             className="resourcesButton"
@@ -220,6 +206,161 @@ const RoadmapPage = (props) => {
       </div>
     );
   };
+
+  const handleGenerateAIResource = (forceRegenerate = false) => {
+    setLoading(true);
+    axios.defaults.baseURL = API_BASE;
+
+    axios({
+      method: "POST",
+      url: "/api/generate-resource",
+      data: {
+        ...resourceParam,
+        regenerate: forceRegenerate || regenerateResource,
+      },
+      withCredentials: true,
+    })
+      .then((res) => {
+        setLoading(false);
+        setResourceMode("ai");
+        setResources(
+          <div className="res">
+            <h2 className="res-heading">{resourceParam.subtopic}</h2>
+            <Markdown>{res.data}</Markdown>
+          </div>
+        );
+        setRegenerateResource(false);
+        setTimeout(() => {
+          setConfettiExplode(true);
+          console.log("exploding confetti...");
+        }, 500);
+      })
+      .catch(() => {
+        setLoading(false);
+        alert("生成资源时出错");
+      });
+  };
+
+  const renderVideoResources = (payload, fallbackPage = 1, addedKeywordText = "") => {
+    const courses = Array.isArray(payload?.courses) ? payload.courses : [];
+    const usedKeyword = payload?.keyword || "";
+    const pageNum = payload?.page || fallbackPage;
+    const addedKeyword = (addedKeywordText || payload?.extra_keyword_cn || payload?.extra_keyword || "").trim();
+
+    const headline = addedKeyword
+      ? `找到 ${courses.length} 个相关课程(搜索: ${usedKeyword}，已添加关键词: ${addedKeyword}，第 ${pageNum} 页)`
+      : `找到 ${courses.length} 个相关课程(搜索: ${usedKeyword}，第 ${pageNum} 页)`;
+
+    if (!courses.length) {
+      return (
+        <div className="res">
+          <h2 className="res-heading">在线课程 - {resourceParam.subtopic}</h2>
+          <p style={{ color: "#999", marginTop: "2em" }}>
+            抱歉,未找到相关课程。搜索关键词: {usedKeyword}
+            {addedKeyword ? `（已添加: ${addedKeyword}）` : ""}
+          </p>
+          <p style={{ color: "#999", marginTop: "1em" }}>
+            建议尝试:
+            <br />添加更具体的关键词后重新搜索
+            <br />或使用左侧 AI 生成学习资源
+          </p>
+        </div>
+      );
+    }
+
+    return (
+      <div className="res">
+        <h2 className="res-heading">在线课程 - {resourceParam.subtopic}</h2>
+        <p style={{ fontSize: "0.9em", color: "#666", marginBottom: "1em" }}>{headline}</p>
+        <div className="course-list">
+          {courses.map((course, index) => (
+            <div
+              key={index}
+              className="course-item"
+              style={{
+                border: "1px solid #ddd",
+                padding: "1em",
+                marginBottom: "1em",
+                borderRadius: "8px",
+              }}
+            >
+              <h3 style={{ marginBottom: "0.5em" }}>
+                <a
+                  href={course.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  style={{ color: "#00A1D6", textDecoration: "none" }}
+                >
+                  {course.title}
+                </a>
+              </h3>
+              <p style={{ fontSize: "0.9em", color: "#666", marginBottom: "0.5em" }}>
+                UP主 {course.author} | 播放量 {course.play}
+              </p>
+              <p style={{ fontSize: "0.85em", color: "#999" }}>{course.description}</p>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  };
+
+  const handleSearchBilibili = (extraKeyword = "", refresh = false, targetPage = null) => {
+    const refinedKeyword = (extraKeyword || "").trim();
+    const searchPage = targetPage && targetPage > 0
+      ? targetPage
+      : (refresh ? Math.floor(Math.random() * 5) + 2 : 1);
+    const cacheKey = `${resourceParam.course || ""}::${resourceParam.subtopic || ""}::${refinedKeyword.toLowerCase()}::${searchPage}`;
+
+    if (!refresh && videoResultCacheRef.current[cacheKey]) {
+      const cached = videoResultCacheRef.current[cacheKey];
+      setResourceMode("video");
+      setVideoSearchPage(cached.page || searchPage);
+      setResources(renderVideoResources(cached.payload, cached.page || searchPage, cached.addedKeyword));
+      setTimeout(() => {
+        setConfettiExplode(true);
+      }, 120);
+      return;
+    }
+
+    setLoading(true);
+    axios.defaults.baseURL = API_BASE;
+
+    axios({
+      method: "POST",
+      url: "/api/search-bilibili",
+      data: {
+        subtopic: resourceParam.subtopic,
+        course: resourceParam.course,
+        extra_keyword: refinedKeyword,
+        refresh,
+        page: searchPage,
+      },
+      withCredentials: true,
+    })
+      .then((res) => {
+        setLoading(false);
+        setResourceMode("video");
+        const resolvedPage = res.data.page || searchPage;
+        const addedKeyword = (res.data.extra_keyword_cn || refinedKeyword || "").trim();
+        videoResultCacheRef.current[cacheKey] = {
+          payload: res.data,
+          page: resolvedPage,
+          addedKeyword,
+        };
+        setVideoSearchPage(resolvedPage);
+        setResources(renderVideoResources(res.data, resolvedPage, addedKeyword));
+
+        setTimeout(() => {
+          setConfettiExplode(true);
+        }, 500);
+      })
+      .catch((err) => {
+        setLoading(false);
+        alert("搜索课程时出错，请稍后重试");
+        console.error(err);
+      });
+  };
     
 
   const ResourcesSection = ({ children }) => {
@@ -228,39 +369,7 @@ const RoadmapPage = (props) => {
         <div className="generativeFill">
           <button
             className="primary"
-            onClick={() => {
-              setLoading(true);
-              axios.defaults.baseURL = API_BASE;
-
-              axios({
-                method: "POST",
-                url: "/api/generate-resource",
-                data: {
-                    ...resourceParam,
-                    regenerate: regenerateResource  // 添加重新生成标志
-                },
-                withCredentials: true,
-              })
-                .then((res) => {
-                  setLoading(false);
-                  setResources(
-                    <div className="res">
-                      <h2 className="res-heading">{resourceParam.subtopic}</h2>
-                      <Markdown>{res.data}</Markdown>
-                    </div>
-                  );
-                  setRegenerateResource(false); // 重置重新生成状态
-                  setTimeout(() => {
-                    setConfettiExplode(true);
-                    console.log("exploding confetti...");
-                  }, 500);
-                })
-                .catch((err) => {
-                  setLoading(false);
-                  alert("生成资源时出错");
-                    navigate(ROUTES.ROADMAP + '?topic=' + encodeURI(topic));
-                });
-            }}
+            onClick={() => handleGenerateAIResource(false)}
           >
             <Bot size={70} strokeWidth={1} className="icon"></Bot>
             AI生成学习资源
@@ -281,85 +390,7 @@ const RoadmapPage = (props) => {
           <button
             className="primary"
             id="searchWidgetTrigger"
-            onClick={() => {
-              setLoading(true);
-              axios.defaults.baseURL = API_BASE;
-
-              axios({
-                method: "POST",
-                url: "/api/search-bilibili",
-                data: {
-                  subtopic: resourceParam.subtopic,
-                  course: resourceParam.course
-                },
-                withCredentials: true,
-              })
-                .then((res) => {
-                  setLoading(false);
-
-                  // 检查是否有课程结果
-                  if (!res.data.courses || res.data.courses.length === 0) {
-                    setResources(
-                      <div className="res">
-                        <h2 className="res-heading">在线课程 - {resourceParam.subtopic}</h2>
-                        <p style={{ color: "#999", marginTop: "2em" }}>
-                          抱歉,未找到相关课程。搜索关键词: {res.data.keyword}
-                        </p>
-                        <p style={{ color: "#999", marginTop: "1em" }}>
-                          建议尝试:
-                          <br/>使用左侧AI Generated Resources"获取学习资源
-                          <br/>或手动在Bilibili搜索相关内容
-                        </p>
-                      </div>
-                    );
-                  } else {
-                    setResources(
-                      <div className="res">
-                        <h2 className="res-heading">在线课程 - {resourceParam.subtopic}</h2>
-                        <p style={{ fontSize: "0.9em", color: "#666", marginBottom: "1em" }}>
-                          找到 {res.data.courses.length} 个相关课程(搜索: {res.data.keyword})
-                        </p>
-                        <div className="course-list">
-                          {res.data.courses.map((course, index) => (
-                            <div key={index} className="course-item" style={{
-                              border: "1px solid #ddd",
-                              padding: "1em",
-                              marginBottom: "1em",
-                              borderRadius: "8px"
-                            }}>
-                              <h3 style={{ marginBottom: "0.5em" }}>
-                                <a
-                                  href={course.url}
-                                  target="_blank"
-                                  rel="noopener noreferrer"
-                                  style={{ color: "#00A1D6", textDecoration: "none" }}
-                                >
-                                  {course.title}
-                                </a>
-                              </h3>
-                              <p style={{ fontSize: "0.9em", color: "#666", marginBottom: "0.5em" }}>
-                                UP主 {course.author} | 播放量 {course.play}
-                              </p>
-                              <p style={{ fontSize: "0.85em", color: "#999" }}>
-                                {course.description}
-                              </p>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    );
-                  }
-
-                  setTimeout(() => {
-                    setConfettiExplode(true);
-                  }, 500);
-                })
-                .catch((err) => {
-                  setLoading(false);
-                  alert("搜索课程时出错，请稍后重试");
-                  console.error(err);
-                });
-            }}
+            onClick={() => handleSearchBilibili("")}
           >
             <FolderSearch
               size={70}
@@ -519,7 +550,6 @@ const RoadmapPage = (props) => {
               console.warn('清理 localStorage 时出错', e);
             }
 
-            alert('已取消学习并删除相关数据');
             navigate('/');
           } else {
             alert('取消学习失败，请稍后重试');
@@ -570,6 +600,10 @@ const RoadmapPage = (props) => {
         onClose={() => {
           setModalOpen(false);
           setResources(null);
+          setResourceMode("ai");
+          setVideoKeywordInput("");
+          setVideoSearchPage(1);
+          videoResultCacheRef.current = {};
         }}
       >
         {!resources ? (
@@ -590,52 +624,113 @@ const RoadmapPage = (props) => {
                 borderTop: "1px solid #eee",   
                 paddingTop: "1.5em"   
               }}>  
-                <button  
-                  onClick={() => {  
-                    setRegenerateResource(true);  
-                    // 重新调用生成函数  
-                    setLoading(true);  
-                    axios.defaults.baseURL = API_BASE; 
-                    
-                    axios({  
-                        method: "POST",  
-                        url: "/api/generate-resource",  
-                        data: {  
-                          ...resourceParam,  
-                          regenerate: true  
-                        },  
-                        withCredentials: true,  
-                      })  
-                        .then((res) => {  
-                          setLoading(false);  
-                          setResources(  
-                            <div className="res">  
-                              <h2 className="res-heading">{resourceParam.subtopic}</h2>  
-                              <Markdown>{res.data}</Markdown>  
-                            </div>  
-                          );  
-                          setRegenerateResource(false);  
-                          setTimeout(() => {  
-                            setConfettiExplode(true);  
-                          }, 500);  
-                        })  
-                        .catch((err) => {  
-                          setLoading(false);  
-                          alert("重新生成资源时出错");  
-                        });  
-                    }}  
-                    style={{  
-                      padding: "0.8em 2em",  
-                      backgroundColor: "#4EAAD1",  
-                      color: "white",  
-                      border: "none",  
-                      borderRadius: "5px",  
-                      cursor: "pointer",  
-                      fontSize: "1em"  
-                    }}  
-                  >  
-                    重新生成内容  
-                  </button>  
+                {resourceMode === "video" ? (
+                  <div style={{ display: "flex", gap: "0.6em", justifyContent: "center", alignItems: "center", flexWrap: "wrap" }}>
+                    <input
+                      value={videoKeywordInput}
+                      onChange={(e) => setVideoKeywordInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key !== "Enter") return;
+                        e.preventDefault();
+                        const kw = (videoKeywordInput || "").trim();
+                        if (!kw) {
+                          alert("请先输入关键词");
+                          return;
+                        }
+                        handleSearchBilibili(kw, false, 1);
+                      }}
+                      placeholder="添加关键词，例如：零基础 / 项目实战"
+                      style={{
+                        minWidth: "280px",
+                        maxWidth: "420px",
+                        width: "56%",
+                        padding: "0.65em 0.8em",
+                        border: "1px solid #cfd8dc",
+                        borderRadius: "5px",
+                        fontSize: "0.95em",
+                      }}
+                    />
+                    <button
+                      onClick={() => {
+                        const kw = (videoKeywordInput || "").trim();
+                        if (!kw) {
+                          alert("请先输入关键词");
+                          return;
+                        }
+                        handleSearchBilibili(kw, false, 1);
+                      }}
+                      style={{
+                        padding: "0.8em 1.4em",
+                        backgroundColor: "#4EAAD1",
+                        color: "white",
+                        border: "none",
+                        borderRadius: "5px",
+                        cursor: "pointer",
+                        fontSize: "1em",
+                      }}
+                    >
+                      添加关键词重新搜索
+                    </button>
+                  </div>
+                ) : (
+                  <button
+                    onClick={() => {
+                      setRegenerateResource(true);
+                      handleGenerateAIResource(true);
+                    }}
+                    style={{
+                      padding: "0.8em 2em",
+                      backgroundColor: "#4EAAD1",
+                      color: "white",
+                      border: "none",
+                      borderRadius: "5px",
+                      cursor: "pointer",
+                      fontSize: "1em",
+                    }}
+                  >
+                    重新生成AI学习资源
+                  </button>
+                )}
+
+                {resourceMode === "video" ? (
+                  <div style={{ display: "flex", gap: "0.6em", justifyContent: "center", alignItems: "center", marginTop: "0.7em" }}>
+                    <button
+                      onClick={() => handleSearchBilibili(videoKeywordInput, false, Math.max(1, videoSearchPage - 1))}
+                      disabled={videoSearchPage <= 1}
+                      style={{
+                        padding: "0.6em 1.1em",
+                        backgroundColor: videoSearchPage <= 1 ? "#b0bec5" : "#607d8b",
+                        color: "white",
+                        border: "none",
+                        borderRadius: "5px",
+                        cursor: videoSearchPage <= 1 ? "not-allowed" : "pointer",
+                        fontSize: "0.95em",
+                      }}
+                    >
+                      上一页
+                    </button>
+                    <button
+                      onClick={() => handleSearchBilibili(videoKeywordInput, false, videoSearchPage + 1)}
+                      style={{
+                        padding: "0.6em 1.1em",
+                        backgroundColor: "#607d8b",
+                        color: "white",
+                        border: "none",
+                        borderRadius: "5px",
+                        cursor: "pointer",
+                        fontSize: "0.95em",
+                      }}
+                    >
+                      下一页
+                    </button>
+                  </div>
+                ) : null}
+
+                {resourceMode === "video" ? (
+                  <div style={{ marginTop: "0.6em", textAlign: "center", fontSize: "0.82em", color: "#6b7280" }}>
+                    当前第 {videoSearchPage} 页
+                  </div>
+                ) : null}
                 </div>  
               </div>  
             </>  

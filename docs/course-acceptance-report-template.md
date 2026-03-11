@@ -50,12 +50,15 @@ This report verifies the following required capabilities:
 - Description:
 - Supports user profile update, password change, avatar update, account deletion.
 - Supports prompt template create/edit/delete/favorite.
+- Prompt templates also support enable/disable and tags, and can take effect at inference time.
 - Supports quiz records and wrong/redo record deletion.
+- Supports direct return to home after confirmed course cancellation (no extra success popup).
 - Evidence (code points):
 - `backend/base.py:501` (`PUT /api/user/settings`)
 - `backend/base.py:542` (`PUT /api/user/password`)
 - `backend/base.py:579` (`POST /api/user/delete-account`)
 - `backend/base.py:655`/`668`/`735` (prompt template CRUD)
+- `backend/mongodb.py:222` (prompt template persistence)
 - `backend/base.py:1084` (`/api/delete-quiz-records`)
 - `backend/base.py:1295` (`/api/wrong-questions/delete`)
 - `backend/base.py:1378` (`DELETE /api/redo-records/<record_id>`)
@@ -69,6 +72,7 @@ This report verifies the following required capabilities:
 - Result: `Pass`
 - Description:
 - User profile analyzer computes activity, mastery, preferences, effectiveness, and recommendations.
+- User-defined prompt templates are injected into model system prompts at runtime (scenario tag match first, fallback to enabled templates).
 - Evidence (code points):
 - `backend/user_profile.py:14` (`UserProfileAnalyzer`)
 - `backend/user_profile.py:49` (`_analyze_learning_activity`)
@@ -76,15 +80,24 @@ This report verifies the following required capabilities:
 - `backend/user_profile.py:238` (`_analyze_learning_preferences`)
 - `backend/user_profile.py:284` (`_analyze_learning_effectiveness`)
 - `backend/user_profile.py:333` (`_generate_recommendations`)
+- `backend/prompt_injector.py:6` (enabled prompt filtering and scenario matching)
+- `backend/prompt_injector.py:75` (system instruction merge)
+- `backend/siliconflow_client.py:95` and `backend/siliconflow_client.py:118` (unified injection to `messages[0].content`)
 - Screenshot points:
 - Figure 7: User profile subject detail page showing computed metrics (`src/pages/userprofile/userprofile.js`).
 - Figure 8: API response screenshot from `/api/user-profile/summary`.
+- Figure 8-1: Same question before/after enabling prompt template (response style comparison).
 
 ### 3.4 Data Query
 
 - Result: `Pass`
 - Description:
 - Supports query of quiz records, user data, wrong questions, redo records, subject overview/detail.
+- Supports online-course (Bilibili) query with keyword refinement and previous/next page navigation.
+- Keyword search is re-based on the initial topic + current input each time (no historical keyword accumulation).
+- When extra keywords are provided, backend prioritizes videos whose title/description match those keywords.
+- Page results are cached on frontend for faster back/forward page rendering; Enter key triggers keyword search.
+- Legacy difficulty interaction has been removed; stale `hardnessIndex` local storage is cleaned up.
 - Evidence (code points):
 - `backend/base.py:1061` (`GET /api/quiz-records`)
 - `backend/base.py:1103` (`GET /api/user-data`)
@@ -92,6 +105,10 @@ This report verifies the following required capabilities:
 - `backend/base.py:1364` (`GET /api/redo-records`)
 - `backend/base.py:1518` (`GET /api/user-profile/subjects-overview`)
 - `backend/base.py:1552` (`GET /api/user-profile/subject-detail`)
+- `backend/base.py` (`POST /api/search-bilibili`, supports `extra_keyword/page/refresh`)
+- `backend/bilibili_search.py` (page-based Bilibili search)
+- `src/pages/roadmap/roadmap.js` (keyword input, Enter trigger, pagination, page cache)
+- `src/pages/userprofile/userprofile.js` (detail-mode back button moved next to header actions)
 - Screenshot points:
 - Figure 9: Subject overview list query with search/sort (`src/pages/userprofile/userprofile.js`).
 - Figure 10: Subject detail panel query result.
@@ -191,7 +208,12 @@ This report verifies the following required capabilities:
 - Register/login
 - Topic input -> roadmap -> quiz
 - Wrong-question and redo flow
-- Settings prompt CRUD
+- Settings prompt CRUD (create/edit/delete/enable/disable/favorite)
+- Prompt runtime integration test: `/api/resource-qa` outgoing `system` contains `[User Custom Prompt Templates]`
+- Online-course search verification: keyword label shown in result text, keyword is not cumulatively stacked, Enter-to-search works.
+- Online-course pagination verification: previous/next page switching, cached pages render quickly when revisited.
+- Course-cancel UX verification: after confirmation, data is cleaned and user returns home without additional success alert.
+- Legacy difficulty cleanup verification: no "difficulty index" UI remains and stale local key is removed.
 - User-profile export/import
 
 ## 5. Optional Advanced Design Notes

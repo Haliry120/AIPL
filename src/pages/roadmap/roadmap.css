@@ -129,15 +129,6 @@
 .grecaptcha-badge {
   visibility: hidden !important;
 }
-.hardness {
-  position: absolute;
-  bottom: 10px;
-  right: 3em;
-  width: max-content;
-  text-decoration: underline;
-  cursor: pointer;
-  opacity: 0.35;
-}
 /* 测验分数显示（非按钮） */
 .quiz-score {
   font-weight: 700;

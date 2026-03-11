@@ -394,6 +394,17 @@ function UserProfile() {
             </div>
           </div>
           <div className="header_actions">
+            {inDetail ? (
+              <button
+                className="refresh_button"
+                onClick={() => {
+                  setSelectedSubject("");
+                  setSubjectDetail(null);
+                }}
+              >
+                返回学科列表
+              </button>
+            ) : null}
             <button className="refresh_button" onClick={fetchOverview} disabled={loading}>
               刷新数据
             </button>
@@ -530,18 +541,6 @@ function UserProfile() {
           </>
         ) : (
           <>
-            <section className="detail_topbar">
-              <button
-                className="refresh_button"
-                onClick={() => {
-                  setSelectedSubject("");
-                  setSubjectDetail(null);
-                }}
-              >
-                返回学科列表
-              </button>
-            </section>
-
             <section className="summary_grid">
               <div className="summary_card">
                 <span>学科</span>

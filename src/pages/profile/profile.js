@@ -81,6 +81,8 @@ const ProfilePage = (props) => {
   const avatarUrl = userManager.getAvatarUrl() || "/avatar.jpg";
 
   useEffect(() => {
+    // Cleanup legacy local difficulty key removed from current product logic.
+    localStorage.removeItem("hardnessIndex");
     const roadmaps = JSON.parse(localStorage.getItem("roadmaps")) || {};
     const quizStats = JSON.parse(localStorage.getItem("quizStats")) || {};
     setStats(getStats(roadmaps, quizStats));
@@ -121,14 +123,6 @@ const ProfilePage = (props) => {
             </NavLink>
             <h3>
               进行中的课程: <b>{Object.keys(topics).length}</b>
-            </h3>
-            <h3>
-              难度指数:{" "}
-              <b>
-                {(
-                  parseFloat(localStorage.getItem("hardnessIndex")) || 1
-                ).toFixed(3)}
-              </b>
             </h3>
           </div>
         </div>

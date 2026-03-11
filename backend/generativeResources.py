@@ -1,7 +1,7 @@
 import siliconflow_client
 
     
-def generate_resources(course, knowledge_level, description, time):
+def generate_resources(course, knowledge_level, description, time, user_id=None):
     """使用硅基流动API生成学习资源"""
     if not course or str(course).strip() == "":
         raise ValueError("course为必填字段，不能为空")
@@ -74,5 +74,7 @@ def generate_resources(course, knowledge_level, description, time):
       user_prompt=user_prompt,
       temperature=1,
       top_p=0.95,
-      max_tokens=8192
+      max_tokens=8192,
+      user_id=user_id,
+      scenario="resource",
     )

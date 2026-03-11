@@ -1,7 +1,7 @@
 import siliconflow_client
 
 
-def translate_text_arr(text_arr, target="zh-CN"):
+def translate_text_arr(text_arr, target="zh-CN", user_id=None):
     """
     使用硅基流动API翻译文本数组
 
@@ -29,7 +29,9 @@ def translate_text_arr(text_arr, target="zh-CN"):
                 user_prompt=user_prompt,
                 temperature=0.3,  # 低温度保证翻译准确性
                 top_p=0.95,
-                max_tokens=512  # 翻译通常不需要太多 tokens
+                max_tokens=512,  # 翻译通常不需要太多 tokens
+                user_id=user_id,
+                scenario="translation",
             )
 
             translated.append(result.strip())

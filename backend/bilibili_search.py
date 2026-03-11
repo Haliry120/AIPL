@@ -2,12 +2,12 @@ from bilibili_api import search, sync
 import asyncio
 
 
-def search_bilibili_courses(keyword):
+def search_bilibili_courses(keyword, page=1):
     """
     使用 bilibili-api-python 库搜索课程
     """
     try:
-        print(f"Searching Bilibili with keyword: {keyword}")
+        print(f"Searching Bilibili with keyword: {keyword}, page: {page}")
 
         # 使用同步方式调用异步函数
         async def async_search():
@@ -16,7 +16,7 @@ def search_bilibili_courses(keyword):
                 keyword=keyword,
                 search_type=search.SearchObjectType.VIDEO,
                 order_type=search.OrderVideo.TOTALRANK,
-                page=1
+                page=page
             )
             return result
 
@@ -33,6 +33,7 @@ def search_bilibili_courses(keyword):
         courses = []
         for video in videos[:10]:  # 限制返回 10 个结果
             courses.append({
+                "bvid": video.get("bvid", ""),
                 "title": video.get("title", "").replace("<em class=\"keyword\">", "").replace("</em>", ""),
                 "platform": "哔哩哔哩",
                 "url": f"https://www.bilibili.com/video/{video.get('bvid', '')}",
